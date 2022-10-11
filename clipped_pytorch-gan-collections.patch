@@ -1,0 +1,2096 @@
+diff --git a/.gitignore b/.gitignore
+index 69ab023..7cf9756 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -1,3 +1,10 @@
++slurm_out/
++old_*/
++logs_*/
++slurm-*.out
++*.parquet
++*.ipynb_checkpoints/
++
+ # vscode
+ .vscode
+ 
+@@ -7,10 +14,10 @@ venv
+ __pycache__
+ 
+ # log
+-logs
++logs/
+ *.zip
+ 
+ # data
+ data
+ stats
+-images
+\ No newline at end of file
++images
+diff --git a/configs/SNGAN_CIFAR10_RES.txt b/configs/SNGAN_CIFAR10_RES.txt
+index e968f5c..03cf1b4 100644
+--- a/configs/SNGAN_CIFAR10_RES.txt
++++ b/configs/SNGAN_CIFAR10_RES.txt
+@@ -2,7 +2,7 @@
+ --batch_size=64
+ --dataset=cifar10
+ --fid_cache=./stats/cifar10.train.npz
+---logdir=./logs/SNGAN_CIFAR10_RES
++--logdir=./logs/sngan
+ --loss=hinge
+ --lr_D=0.0002
+ --lr_G=0.0002
+@@ -13,4 +13,5 @@
+ --sample_size=64
+ --seed=0
+ --total_steps=100000
+---z_dim=128
+\ No newline at end of file
++--z_dim=128
++--desc=BASELINE
+diff --git a/configs/WGANGP_CIFAR10_RES.txt b/configs/WGANGP_CIFAR10_RES.txt
+index 5cabf33..0a2e69a 100644
+--- a/configs/WGANGP_CIFAR10_RES.txt
++++ b/configs/WGANGP_CIFAR10_RES.txt
+@@ -3,7 +3,7 @@
+ --batch_size=64
+ --dataset=cifar10
+ --fid_cache=./stats/cifar10.train.npz
+---logdir=./logs/WGANGP_CIFAR10_RES
++--logdir=./logs/wgangp
+ --loss=was
+ --lr_D=0.0002
+ --lr_G=0.0002
+@@ -15,3 +15,4 @@
+ --seed=0
+ --total_steps=100000
+ --z_dim=128
++--desc=BASELINE
+diff --git a/configs/WGAN_CIFAR10_CNN.txt b/configs/WGAN_CIFAR10_CNN.txt
+index 1b3fa90..734736e 100644
+--- a/configs/WGAN_CIFAR10_CNN.txt
++++ b/configs/WGAN_CIFAR10_CNN.txt
+@@ -3,7 +3,7 @@
+ --batch_size=128
+ --dataset=cifar10
+ --fid_cache=./stats/cifar10.train.npz
+---logdir=./logs/WGAN_CIFAR10_CNN
++--logdir=./logs_wgan/WGAN_CIFAR10_CNN
+ --loss=was
+ --lr_D=0.0002
+ --lr_G=0.0002
+diff --git a/dcgan.py b/dcgan.py
+index 995dca2..8ea7b00 100644
+--- a/dcgan.py
++++ b/dcgan.py
+@@ -1,3 +1,4 @@
++from asyncio.log import logger
+ import os
+ 
+ import torch
+@@ -11,8 +12,11 @@ from pytorch_gan_metrics import get_inception_score_and_fid
+ 
+ import source.models.dcgan as models
+ import source.losses as losses
+-from source.utils import generate_imgs, infiniteloop, set_seed
+ 
++from source.utils import generate_imgs, infiniteloop, set_seed #, get_desc, get_output_dir
++from source import extragradient
++from source import common
++from source import utils
+ 
+ net_G_models = {
+     'cnn32': models.Generator32,
+@@ -29,19 +33,38 @@ loss_fns = {
+     'softplus': losses.Softplus
+ }
+ 
++optimizers = {
++    'adam': torch.optim.Adam,
++    'sgd': torch.optim.SGD,
++    'extraadam': extragradient.ExtraAdam,
++    'extrasgd': extragradient.ExtraSGD
++}
++
+ FLAGS = flags.FLAGS
+ # model and training
+ flags.DEFINE_enum('dataset', 'cifar10', ['cifar10', 'stl10'], "dataset")
++flags.DEFINE_string('data_dir', None, "dataset directory")
+ flags.DEFINE_enum('arch', 'cnn32', net_G_models.keys(), "architecture")
+ flags.DEFINE_integer('total_steps', 50000, "total number of training steps")
+ flags.DEFINE_integer('batch_size', 128, "batch size")
++
++flags.DEFINE_bool('evaluate', False, 'Eval and generate stochastic histograms')
++
++# optimizers
++flags.DEFINE_enum('opt', 'adam', optimizers.keys(), "optimizer")
+ flags.DEFINE_float('lr_G', 2e-4, "Generator learning rate")
+ flags.DEFINE_float('lr_D', 2e-4, "Discriminator learning rate")
+-flags.DEFINE_multi_float('betas', [0.5, 0.9], "for Adam")
++flags.DEFINE_multi_float('betas', [0.5, 0.9], "for adam")
++
++flags.DEFINE_enum('clip_mode', 'none', ['none', 'value', 'norm'], 'Clipping type')
++flags.DEFINE_float('clip_G', None, 'Generator max clip')
++flags.DEFINE_float('clip_D', None, 'Discriminator max clip')
++
+ flags.DEFINE_integer('n_dis', 1, "update Generator every this steps")
+ flags.DEFINE_integer('z_dim', 100, "latent space dimension")
+ flags.DEFINE_enum('loss', 'bce', loss_fns.keys(), "loss function")
+ flags.DEFINE_integer('seed', 0, "random seed")
++
+ # logging
+ flags.DEFINE_integer('eval_step', 5000, "evaluate FID and Inception Score")
+ flags.DEFINE_integer('sample_step', 500, "sample image every this steps")
+@@ -49,6 +72,8 @@ flags.DEFINE_integer('sample_size', 64, "sampling size of images")
+ flags.DEFINE_string('logdir', './logs/DCGAN_CIFAR10', 'logging folder')
+ flags.DEFINE_bool('record', True, "record inception score and FID")
+ flags.DEFINE_string('fid_cache', './stats/cifar10.train.npz', 'FID cache')
++flags.DEFINE_string('desc', None, 'Extra description string')
++
+ # generate
+ flags.DEFINE_bool('generate', False, 'generate images')
+ flags.DEFINE_string('pretrain', None, 'path to test model')
+@@ -58,75 +83,72 @@ flags.DEFINE_integer('num_images', 50000, 'the number of generated images')
+ device = torch.device('cuda:0')
+ 
+ 
+-def generate():
+-    assert FLAGS.pretrain is not None, "set model weight by --pretrain [model]"
++def eval_run_loop(
++    FLAGS: flags.FLAGS, 
++    dataloader: torch.utils.data.DataLoader,
++    loss_fn: callable,
++    net_G: torch.nn.Module,
++    net_D: torch.nn.Module,
++    acc_G: extragradient.Acc, 
++    acc_D: extragradient.Acc,
++):
++    looper = infiniteloop(dataloader)
++    with trange(1, FLAGS.total_steps + 1, desc='Eval loop', ncols=0) as pbar:
++        for step in pbar:
++            # Discriminator
++            for _ in range(FLAGS.n_dis):
++                with torch.no_grad():
++                    z = torch.randn(FLAGS.batch_size, FLAGS.z_dim).to(device)
++                    fake = net_G(z).detach()
++                real = next(looper).to(device)
++                net_D_real = net_D(real)
++                net_D_fake = net_D(fake)
++                loss = loss_fn(net_D_real, net_D_fake)
+ 
+-    net_G = net_G_models[FLAGS.arch](FLAGS.z_dim).to(device)
+-    net_G.load_state_dict(torch.load(FLAGS.pretrain)['net_G'])
+-    net_G.eval()
+-
+-    counter = 0
+-    os.makedirs(FLAGS.output)
+-    with torch.no_grad():
+-        for start in trange(
+-                0, FLAGS.num_images, FLAGS.batch_size, dynamic_ncols=True):
+-            batch_size = min(FLAGS.batch_size, FLAGS.num_images - start)
+-            z = torch.randn(batch_size, FLAGS.z_dim).to(device)
+-            x = net_G(z).cpu()
+-            x = (x + 1) / 2
+-            for image in x:
+-                save_image(
+-                    image, os.path.join(FLAGS.output, '%d.png' % counter))
+-                counter += 1
++                net_D.zero_grad()
++                loss.backward()
++                acc_D.accumulate(net_D)
++
++                if FLAGS.loss == 'was':
++                    loss = -loss
++                pbar.set_postfix(loss='%.4f' % loss)
++
++            # Generator
++            z = torch.randn(FLAGS.batch_size * 2, FLAGS.z_dim).to(device)
++            loss = loss_fn(net_D(net_G(z)))
++
++            net_G.zero_grad()
++            loss.backward()
++            acc_G.accumulate(net_G)
+ 
+ 
+ def train():
+-    if FLAGS.dataset == 'cifar10':
+-        dataset = datasets.CIFAR10(
+-            './data', train=True, download=True,
+-            transform=transforms.Compose([
+-                transforms.RandomHorizontalFlip(),
+-                transforms.ToTensor(),
+-                transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+-            ]))
+-    if FLAGS.dataset == 'stl10':
+-        dataset = datasets.STL10(
+-            './data', split='unlabeled', download=True,
+-            transform=transforms.Compose([
+-                transforms.Resize((48, 48)),
+-                transforms.RandomHorizontalFlip(),
+-                transforms.ToTensor(),
+-                transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+-            ]))
+-
+-    dataloader = torch.utils.data.DataLoader(
+-        dataset, batch_size=FLAGS.batch_size, shuffle=True, num_workers=4,
+-        drop_last=True)
++    dataset, dataloader = common.init_dataloaders(FLAGS)
+ 
+     net_G = net_G_models[FLAGS.arch](FLAGS.z_dim).to(device)
+     net_D = net_D_models[FLAGS.arch]().to(device)
+     loss_fn = loss_fns[FLAGS.loss]()
+ 
+-    optim_G = optim.Adam(net_G.parameters(), lr=FLAGS.lr_G, betas=FLAGS.betas)
+-    optim_D = optim.Adam(net_D.parameters(), lr=FLAGS.lr_D, betas=FLAGS.betas)
+-    sched_G = optim.lr_scheduler.LambdaLR(
+-        optim_G, lambda step: 1 - step / FLAGS.total_steps)
+-    sched_D = optim.lr_scheduler.LambdaLR(
+-        optim_D, lambda step: 1 - step / FLAGS.total_steps)
++    optim_G, optim_D, sched_G, sched_D = common.init_optimizers(FLAGS, optimizers, net_G, net_D)
++    clip_G, clip_D = common.init_clip_fns(FLAGS) # returns no-op if clip_mode is None
+ 
+-    os.makedirs(os.path.join(FLAGS.logdir, 'sample'))
+-    writer = SummaryWriter(os.path.join(FLAGS.logdir))
+-    sample_z = torch.randn(FLAGS.sample_size, FLAGS.z_dim).to(device)
+-    with open(os.path.join(FLAGS.logdir, "flagfile.txt"), 'w') as f:
+-        f.write(FLAGS.flags_into_string())
+-    writer.add_text(
+-        "flagfile", FLAGS.flags_into_string().replace('\n', '  \n'))
++    is_extra = isinstance(optim_G, extragradient.Extragradient)
++
++    # init tensorboard and logging dirs
++    desc = utils.get_desc("DCGAN", FLAGS)
++    log_dir = utils.get_output_dir(FLAGS.logdir, desc)
++    os.makedirs(os.path.join(log_dir, 'sample'))
++    writer = common.init_tensorboard(FLAGS, log_dir, device)
+ 
++    # generate initial samples
++    sample_z = torch.randn(FLAGS.sample_size, FLAGS.z_dim).to(device)
+     real, _ = next(iter(dataloader))
+     grid = (make_grid(real[:FLAGS.sample_size]) + 1) / 2
+     writer.add_image('real_sample', grid)
+ 
++    # start training
+     looper = infiniteloop(dataloader)
++    step_disc = 1
+     with trange(1, FLAGS.total_steps + 1, desc='Training', ncols=0) as pbar:
+         for step in pbar:
+             # Discriminator
+@@ -140,12 +162,19 @@ def train():
+                 loss = loss_fn(net_D_real, net_D_fake)
+ 
+                 optim_D.zero_grad()
+-                loss.backward()
+-                optim_D.step()
++                loss.backward()             # accumulate gradients
++                
++                clip_D(net_D.parameters())  # clip gradients
++                if is_extra and step_disc % 2 != 0:
++                    optim_D.extrapolation()
++                else:
++                    optim_D.step()
++                step_disc += 1
+ 
+                 if FLAGS.loss == 'was':
+                     loss = -loss
+                 pbar.set_postfix(loss='%.4f' % loss)
++
+             writer.add_scalar('loss', loss, step)
+ 
+             # Generator
+@@ -153,38 +182,28 @@ def train():
+             loss = loss_fn(net_D(net_G(z)))
+ 
+             optim_G.zero_grad()
+-            loss.backward()
+-            optim_G.step()
++            loss.backward()             # accumulate gradients
++            clip_G(net_G.parameters())  # clip gradients
++            if is_extra and step % 2 != 0:
++                optim_G.extrapolation()
++            else:
++                optim_G.step()
+ 
+             sched_G.step()
+             sched_D.step()
+ 
+             if step == 1 or step % FLAGS.sample_step == 0:
+-                fake = net_G(sample_z).cpu()
+-                grid = (make_grid(fake) + 1) / 2
+-                writer.add_image('sample', grid, step)
+-                save_image(grid, os.path.join(
+-                    FLAGS.logdir, 'sample', '%d.png' % step))
++                common.write_samples(step, log_dir, net_G, sample_z, writer)
+ 
+             if step == 1 or step % FLAGS.eval_step == 0:
+-                torch.save({
+-                    'net_G': net_G.state_dict(),
+-                    'net_D': net_D.state_dict(),
+-                    'optim_G': optim_G.state_dict(),
+-                    'optim_D': optim_D.state_dict(),
+-                    'sched_G': sched_G.state_dict(),
+-                    'sched_D': sched_D.state_dict(),
+-                }, os.path.join(FLAGS.logdir, 'model.pt'))
++                common.checkpoint(log_dir, step, net_G, net_D, optim_G, optim_D, sched_G, sched_D)
++
+                 if FLAGS.record:
+-                    imgs = generate_imgs(
+-                        net_G, device, FLAGS.z_dim,
+-                        FLAGS.num_images, FLAGS.batch_size)
+-                    IS, FID = get_inception_score_and_fid(
+-                        imgs, FLAGS.fid_cache, verbose=True)
++                    IS, FID = common.eval_metrics(FLAGS, net_G, device)
+                     pbar.write(
+-                        "%s/%s Inception Score: %.3f(%.5f), "
+-                        "FID: %6.3f" % (
+-                            step, FLAGS.total_steps, IS[0], IS[1], FID))
++                        "%s/%s Inception Score: %.3f(%.5f), FID: %6.3f" 
++                        % (step, FLAGS.total_steps, IS[0], IS[1], FID)
++                    )
+                     writer.add_scalar('Inception_Score', IS[0], step)
+                     writer.add_scalar('Inception_Score_std', IS[1], step)
+                     writer.add_scalar('FID', FID, step)
+@@ -194,7 +213,19 @@ def train():
+ def main(argv):
+     set_seed(FLAGS.seed)
+     if FLAGS.generate:
+-        generate()
++        common.generate(FLAGS=FLAGS, net_G_models=net_G_models, device=device)
++
++    elif FLAGS.evaluate:
++        common.evaluate(
++            FLAGS=FLAGS, 
++            run_loop=eval_run_loop,
++            net_G_models=net_G_models,
++            net_D_models=net_D_models,
++            loss_fns=loss_fns,
++            tag="DCGAN",
++            device=device,
++        )
++
+     else:
+         train()
+ 
+diff --git a/requirements.txt b/requirements.txt
+index f24a208..3bc09a2 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -1,10 +1,8 @@
+ absl-py
+-pytorch_gan_metrics
+ scipy
+ tensorflow
+ tensorboardX
+ tqdm
+-
+---find-links https://download.pytorch.org/whl/cu113/torch_stable.html
+-torch==1.10.1+cu113
+-torchvision==0.11.2+cu113
++seaborn
++torch>=1.10.1
++torchvision>=0.11.2
+diff --git a/sngan.py b/sngan.py
+index 29cf367..4b1afd8 100644
+--- a/sngan.py
++++ b/sngan.py
+@@ -13,6 +13,11 @@ import source.models.sngan as models
+ import source.losses as losses
+ from source.utils import generate_imgs, infiniteloop, set_seed
+ 
++from source import extragradient
++from source import losses
++from source import utils
++from source import common
++
+ 
+ net_G_models = {
+     'res32': models.ResGenerator32,
+@@ -31,27 +36,47 @@ loss_fns = {
+     'softplus': losses.Softplus
+ }
+ 
++optimizers = {
++    'adam': torch.optim.Adam,
++    'sgd': torch.optim.SGD,
++    'extraadam': extragradient.ExtraAdam,
++    'extrasgd': extragradient.ExtraSGD
++}
+ 
+ FLAGS = flags.FLAGS
+ # model and training
+ flags.DEFINE_enum('dataset', 'cifar10', ['cifar10', 'stl10'], "dataset")
++flags.DEFINE_string('data_dir', "./data", "dataset directory")
+ flags.DEFINE_enum('arch', 'res32', net_G_models.keys(), "architecture")
+ flags.DEFINE_integer('total_steps', 100000, "total number of training steps")
+ flags.DEFINE_integer('batch_size', 64, "batch size")
++
++flags.DEFINE_bool('evaluate', False, 'Eval and generate stochastic histograms')
++
++# optimizers
++flags.DEFINE_enum('opt', 'adam', optimizers.keys(), "optimizer")
+ flags.DEFINE_float('lr_G', 2e-4, "Generator learning rate")
+ flags.DEFINE_float('lr_D', 2e-4, "Discriminator learning rate")
+ flags.DEFINE_multi_float('betas', [0.0, 0.9], "for Adam")
++
++flags.DEFINE_enum('clip_mode', 'none', ['none', 'value', 'norm'], 'Clipping type')
++flags.DEFINE_float('clip_G', None, 'Generator max clip')
++flags.DEFINE_float('clip_D', None, 'Discriminator max clip')
++
+ flags.DEFINE_integer('n_dis', 5, "update Generator every this steps")
+ flags.DEFINE_integer('z_dim', 128, "latent space dimension")
+ flags.DEFINE_enum('loss', 'hinge', loss_fns.keys(), "loss function")
+ flags.DEFINE_integer('seed', 0, "random seed")
++
+ # logging
+ flags.DEFINE_integer('eval_step', 5000, "evaluate FID and Inception Score")
+ flags.DEFINE_integer('sample_step', 500, "sample image every this steps")
+ flags.DEFINE_integer('sample_size', 64, "sampling size of images")
+-flags.DEFINE_string('logdir', './logs/SNGAN_CIFAR10_RES', 'log folder')
++flags.DEFINE_string('logdir', './logs/sngan', 'log folder')
+ flags.DEFINE_bool('record', True, "record inception score and FID")
+ flags.DEFINE_string('fid_cache', './stats/cifar10.train.npz', 'FID cache')
++flags.DEFINE_string('desc', None, 'Extra description string')
++
+ # generate
+ flags.DEFINE_bool('generate', False, 'generate images')
+ flags.DEFINE_string('pretrain', None, 'path to test model')
+@@ -61,75 +86,70 @@ flags.DEFINE_integer('num_images', 50000, 'the number of generated images')
+ device = torch.device('cuda:0')
+ 
+ 
+-def generate():
+-    assert FLAGS.pretrain is not None, "set model weight by --pretrain [model]"
++def eval_run_loop(
++    FLAGS: flags.FLAGS, 
++    dataloader: torch.utils.data.DataLoader,
++    loss_fn: callable,
++    net_G: torch.nn.Module,
++    net_D: torch.nn.Module,
++    acc_G: extragradient.Acc, 
++    acc_D: extragradient.Acc,
++):
++    looper = infiniteloop(dataloader)
++    with trange(1, FLAGS.total_steps + 1, desc='Eval loop', ncols=0) as pbar:
++        for step in pbar:
++            # Discriminator
++            for _ in range(FLAGS.n_dis):
++                with torch.no_grad():
++                    z = torch.randn(FLAGS.batch_size, FLAGS.z_dim).to(device)
++                    fake = net_G(z).detach()
++                real = next(looper).to(device)
++                net_D_real = net_D(real)
++                net_D_fake = net_D(fake)
++                loss = loss_fn(net_D_real, net_D_fake)
+ 
+-    net_G = net_G_models[FLAGS.arch](FLAGS.z_dim).to(device)
+-    net_G.load_state_dict(torch.load(FLAGS.pretrain)['net_G'])
+-    net_G.eval()
+-
+-    counter = 0
+-    os.makedirs(FLAGS.output)
+-    with torch.no_grad():
+-        for start in trange(
+-                0, FLAGS.num_images, FLAGS.batch_size, dynamic_ncols=True):
+-            batch_size = min(FLAGS.batch_size, FLAGS.num_images - start)
+-            z = torch.randn(batch_size, FLAGS.z_dim).to(device)
+-            x = net_G(z).cpu()
+-            x = (x + 1) / 2
+-            for image in x:
+-                save_image(
+-                    image, os.path.join(FLAGS.output, '%d.png' % counter))
+-                counter += 1
++                net_D.zero_grad()
++                loss.backward()
++                acc_D.accumulate(net_D)
++
++                if FLAGS.loss == 'was':
++                    loss = -loss
++                pbar.set_postfix(loss='%.4f' % loss)
++
++            # Generator
++            z = torch.randn(FLAGS.batch_size * 2, FLAGS.z_dim).to(device)
++            loss = loss_fn(net_D(net_G(z)))
++
++            net_G.zero_grad()
++            loss.backward()
++            acc_G.accumulate(net_G)
+ 
+ 
+ def train():
+-    if FLAGS.dataset == 'cifar10':
+-        dataset = datasets.CIFAR10(
+-            './data', train=True, download=True,
+-            transform=transforms.Compose([
+-                transforms.ToTensor(),
+-                transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+-                transforms.Lambda(lambda x: x + torch.rand_like(x) / 128)
+-            ]))
+-    if FLAGS.dataset == 'stl10':
+-        dataset = datasets.STL10(
+-            './data', split='unlabeled', download=True,
+-            transform=transforms.Compose([
+-                transforms.Resize((48, 48)),
+-                transforms.ToTensor(),
+-                transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+-                transforms.Lambda(lambda x: x + torch.rand_like(x) / 128)
+-            ]))
+-
+-    dataloader = torch.utils.data.DataLoader(
+-        dataset, batch_size=FLAGS.batch_size, shuffle=True, num_workers=4,
+-        drop_last=True)
++    dataset, dataloader = common.init_dataloaders(FLAGS)
+ 
+     net_G = net_G_models[FLAGS.arch](FLAGS.z_dim).to(device)
+     net_D = net_D_models[FLAGS.arch]().to(device)
+     loss_fn = loss_fns[FLAGS.loss]()
+ 
+-    optim_G = optim.Adam(net_G.parameters(), lr=FLAGS.lr_G, betas=FLAGS.betas)
+-    optim_D = optim.Adam(net_D.parameters(), lr=FLAGS.lr_D, betas=FLAGS.betas)
+-    sched_G = optim.lr_scheduler.LambdaLR(
+-        optim_G, lambda step: 1 - step / FLAGS.total_steps)
+-    sched_D = optim.lr_scheduler.LambdaLR(
+-        optim_D, lambda step: 1 - step / FLAGS.total_steps)
++    optim_G, optim_D, sched_G, sched_D = common.init_optimizers(FLAGS, optimizers, net_G, net_D)
++    clip_G, clip_D = common.init_clip_fns(FLAGS) # returns no-op if clip_mode is None
++
++    is_extra = isinstance(optim_G, extragradient.Extragradient)
+ 
+-    os.makedirs(os.path.join(FLAGS.logdir, 'sample'))
+-    writer = SummaryWriter(os.path.join(FLAGS.logdir))
++    desc = utils.get_desc("SNGAN", FLAGS)
++    log_dir = utils.get_output_dir(FLAGS.logdir, desc)
++    os.makedirs(os.path.join(log_dir, 'sample'))
++
++    writer = common.init_tensorboard(FLAGS, log_dir, device)
+     sample_z = torch.randn(FLAGS.sample_size, FLAGS.z_dim).to(device)
+-    with open(os.path.join(FLAGS.logdir, "flagfile.txt"), 'w') as f:
+-        f.write(FLAGS.flags_into_string())
+-    writer.add_text(
+-        "flagfile", FLAGS.flags_into_string().replace('\n', '  \n'))
+ 
+     real, _ = next(iter(dataloader))
+     grid = (make_grid(real[:FLAGS.sample_size]) + 1) / 2
+     writer.add_image('real_sample', grid)
+ 
+     looper = infiniteloop(dataloader)
++    step_disc = 1
+     with trange(1, FLAGS.total_steps + 1, desc='Training', ncols=0) as pbar:
+         for step in pbar:
+             # Discriminator
+@@ -140,64 +160,79 @@ def train():
+                 real = next(looper).to(device)
+                 net_D_real = net_D(real)
+                 net_D_fake = net_D(fake)
+-                loss = loss_fn(net_D_real, net_D_fake)
++                loss_D = loss_fn(net_D_real, net_D_fake)
+ 
+                 optim_D.zero_grad()
+-                loss.backward()
+-                optim_D.step()
++                loss_D.backward()
++
++                clip_D(net_D.parameters())  # clip gradients
++                if is_extra and step_disc % 2 != 0:
++                    optim_D.extrapolation()
++                else:
++                    optim_D.step()
++                step_disc += 1
+ 
+                 if FLAGS.loss == 'was':
+-                    loss = -loss
+-                pbar.set_postfix(loss='%.4f' % loss)
+-            writer.add_scalar('loss', loss, step)
++                    loss_D = -loss_D
++                pbar.set_postfix(loss='%.4f' % loss_D)
++            writer.add_scalar('loss', loss_D, step)
++
+ 
+             # Generator
+             z = torch.randn(FLAGS.batch_size * 2, FLAGS.z_dim).to(device)
+-            loss = loss_fn(net_D(net_G(z)))
++            loss_G = loss_fn(net_D(net_G(z)))
+ 
+             optim_G.zero_grad()
+-            loss.backward()
+-            optim_G.step()
++            loss_G.backward()
++
++            clip_G(net_G.parameters())  # clip gradients
++            if is_extra and step % 2 != 0:
++                optim_G.extrapolation()
++            else:
++                optim_G.step()
+ 
+             sched_G.step()
+             sched_D.step()
+ 
+             if step == 1 or step % FLAGS.sample_step == 0:
+-                fake = net_G(sample_z).cpu()
+-                grid = (make_grid(fake) + 1) / 2
+-                writer.add_image('sample', grid, step)
+-                save_image(grid, os.path.join(
+-                    FLAGS.logdir, 'sample', '%d.png' % step))
++                common.write_samples(step, log_dir, net_G, sample_z, writer)
+ 
+             if step == 1 or step % FLAGS.eval_step == 0:
+-                torch.save({
+-                    'net_G': net_G.state_dict(),
+-                    'net_D': net_D.state_dict(),
+-                    'optim_G': optim_G.state_dict(),
+-                    'optim_D': optim_D.state_dict(),
+-                    'sched_G': sched_G.state_dict(),
+-                    'sched_D': sched_D.state_dict(),
+-                }, os.path.join(FLAGS.logdir, 'model.pt'))
++                common.checkpoint(log_dir, step, net_G, net_D, optim_G, optim_D, sched_G, sched_D)
++
+                 if FLAGS.record:
+-                    imgs = generate_imgs(
+-                        net_G, device, FLAGS.z_dim,
+-                        FLAGS.num_images, FLAGS.batch_size)
+-                    IS, FID = get_inception_score_and_fid(
+-                        imgs, FLAGS.fid_cache, verbose=True)
++                    IS, FID = common.eval_metrics(FLAGS, net_G, device)
+                     pbar.write(
+-                        "%s/%s Inception Score: %.3f(%.5f), "
+-                        "FID: %6.3f" % (
+-                            step, FLAGS.total_steps, IS[0], IS[1], FID))
++                        "%s/%s Inception Score: %.3f(%.5f), FID: %6.3f" 
++                        % (step, FLAGS.total_steps, IS[0], IS[1], FID)
++                    )
+                     writer.add_scalar('Inception_Score', IS[0], step)
+                     writer.add_scalar('Inception_Score_std', IS[1], step)
+                     writer.add_scalar('FID', FID, step)
++                
++            if loss_D.isnan().item() or loss_G.isnan().item():
++                break
++
+     writer.close()
+ 
+ 
+ def main(argv):
+     set_seed(FLAGS.seed)
+     if FLAGS.generate:
+-        generate()
++        # generate()
++        common.generate(FLAGS=FLAGS, net_G_models=net_G_models, device=device)
++
++    elif FLAGS.evaluate:
++        common.evaluate(
++            FLAGS=FLAGS, 
++            run_loop=eval_run_loop,
++            net_G_models=net_G_models,
++            net_D_models=net_D_models,
++            loss_fns=loss_fns,
++            tag="SNGAN",
++            device=device,
++        )
++
+     else:
+         train()
+ 
+diff --git a/source/__init__.py b/source/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/source/common.py b/source/common.py
+new file mode 100644
+index 0000000..b07a7c4
+--- /dev/null
++++ b/source/common.py
+@@ -0,0 +1,219 @@
++import os
++from absl import flags, app
++from tqdm import trange
++from typing import Callable, Union, Tuple, Protocol, Any
++import numpy as np
++
++from pytorch_gan_metrics import get_inception_score_and_fid
++
++import torch
++import torch.optim as optim
++from torch.utils.data import DataLoader
++from torchvision import datasets, transforms
++from torchvision.utils import make_grid, save_image
++from tensorboardX import SummaryWriter
++
++
++from source import utils
++from source import extragradient
++
++
++def generate(FLAGS, net_G_models: dict, device='cuda:0'):
++    assert FLAGS.pretrain is not None, "set model weight by --pretrain [model]"
++    if FLAGS.G_dim != 256:
++        raise NotImplementedError
++
++    net_G = net_G_models[FLAGS.arch](FLAGS.z_dim).to(device)
++    net_G.load_state_dict(torch.load(FLAGS.pretrain)['net_G'])
++    net_G.eval()
++
++    if FLAGS.generate_grid:
++        # generates a single file rather than a folder
++        sample_z = torch.randn(FLAGS.num_images, FLAGS.z_dim).to(device)
++        write_samples(0, FLAGS.output, net_G, sample_z, None)
++        exit()
++
++    counter = 0
++    os.makedirs(FLAGS.output)
++    with torch.no_grad():
++        for start in trange(
++                0, FLAGS.num_images, FLAGS.batch_size, dynamic_ncols=True):
++            batch_size = min(FLAGS.batch_size, FLAGS.num_images - start)
++            z = torch.randn(batch_size, FLAGS.z_dim).to(device)
++            x = net_G(z).cpu()
++            x = (x + 1) / 2
++            for image in x:
++                save_image(
++                    image, os.path.join(FLAGS.output, '%d.png' % counter))
++                counter += 1
++
++
++def init_dataloaders(FLAGS):
++    """ 
++    Init and return dataset and dataloader
++    """
++    if FLAGS.dataset == 'cifar10':
++        dataset = datasets.CIFAR10(
++            FLAGS.data_dir, train=True, download=True,
++            transform=transforms.Compose([
++                transforms.RandomHorizontalFlip(),
++                transforms.ToTensor(),
++                transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
++            ]))
++    if FLAGS.dataset == 'stl10':
++        dataset = datasets.STL10(
++            FLAGS.data_dir, split='unlabeled', download=True,
++            transform=transforms.Compose([
++                transforms.Resize((48, 48)),
++                transforms.RandomHorizontalFlip(),
++                transforms.ToTensor(),
++                transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
++            ]))
++
++    dataloader = torch.utils.data.DataLoader(
++        dataset, batch_size=FLAGS.batch_size, shuffle=True, num_workers=4,
++        drop_last=True)
++
++    return dataset, dataloader
++
++
++def init_optimizers(FLAGS, optimizers, net_G, net_D):
++    # init optimizer (can be abstracted)
++    opt_kwargs = {}
++    if FLAGS.opt in ['adam', 'extraadam']:
++        opt_kwargs['betas'] = FLAGS.betas
++
++    optim_G = optimizers[FLAGS.opt](net_G.parameters(), lr=FLAGS.lr_G, **opt_kwargs)
++    optim_D = optimizers[FLAGS.opt](net_D.parameters(), lr=FLAGS.lr_D, **opt_kwargs)
++
++    is_extra = isinstance(optim_G, extragradient.Extragradient)
++    print(f"\n\t\tUsing Extragradient optimizer: {is_extra}\n")
++
++    sched_G = optim.lr_scheduler.LambdaLR(
++        optim_G, lambda step: 1 - step / FLAGS.total_steps)
++    sched_D = optim.lr_scheduler.LambdaLR(
++        optim_D, lambda step: 1 - step / FLAGS.total_steps)
++
++    return optim_G, optim_D, sched_G, sched_D
++
++
++def init_clip_fns(FLAGS):
++    clip_G = extragradient.get_clip_fn(FLAGS.clip_mode, clip_max=FLAGS.clip_G)
++    clip_D = extragradient.get_clip_fn(FLAGS.clip_mode, clip_max=FLAGS.clip_D)
++    return clip_G, clip_D
++
++
++def init_tensorboard(FLAGS, log_dir, device='cuda:0'):
++    writer = SummaryWriter(os.path.join(log_dir))
++    with open(os.path.join(log_dir, "flagfile.txt"), 'w') as f:
++        f.write(FLAGS.flags_into_string())
++    writer.add_text(
++        "flagfile", FLAGS.flags_into_string().replace('\n', '  \n'))
++    return writer
++
++
++def write_samples(step, outpath, net_G, sample_z, writer=None):
++    fake = net_G(sample_z).cpu()
++    nrow = np.ceil(np.sqrt(len(fake))).astype(int)
++    grid = (make_grid(fake, nrow=nrow) + 1) / 2
++    if writer is not None:
++        writer.add_image('sample', grid, step)
++    save_image(grid, outpath)
++
++
++def checkpoint(log_dir, step, net_G, net_D, optim_G, optim_D, sched_G, sched_D):
++    torch.save({
++        'net_G': net_G.state_dict(),
++        'net_D': net_D.state_dict(),
++        'optim_G': optim_G.state_dict(),
++        'optim_D': optim_D.state_dict(),
++        'sched_G': sched_G.state_dict(),
++        'sched_D': sched_D.state_dict(),
++    }, os.path.join(log_dir, f'model_{step}.pt'))
++
++
++def eval_metrics(FLAGS, net_G, device='cuda:0'):
++    imgs = utils.generate_imgs(net_G, device, FLAGS.z_dim, FLAGS.num_images, FLAGS.batch_size)
++    IS, FID = get_inception_score_and_fid(imgs, FLAGS.fid_cache, verbose=True)
++    return IS, FID
++
++
++class LoopSignature(Protocol):
++    def __call__(
++        self, 
++        FLAGS: flags.FLAGS, 
++        dataloader: DataLoader,
++        loss_fn: callable,
++        net_G: torch.nn.Module,
++        net_D: torch.nn.Module,
++        acc_G: extragradient.Acc, 
++        acc_D: extragradient.Acc,
++    ): 
++        ...
++
++def evaluate(
++    FLAGS, 
++    run_loop: LoopSignature,
++    net_G_models: dict, 
++    net_D_models: dict, 
++    loss_fns: dict, 
++    tag: str,
++    device: str = 'cuda:0'
++):
++    print("Evaluating...")
++    assert FLAGS.pretrain is not None, "set model weight by --pretrain [model]"
++
++    dataset, dataloader = init_dataloaders(FLAGS)
++
++    # init model and loss
++    net_G = net_G_models[FLAGS.arch](FLAGS.z_dim).to(device)
++    net_D = net_D_models[FLAGS.arch]().to(device)
++
++    state_dict = torch.load(FLAGS.pretrain)
++    net_G.load_state_dict(state_dict['net_G'])
++    net_D.load_state_dict(state_dict['net_D'])
++
++    loss_fn = loss_fns[FLAGS.loss]()
++
++    # init tensorboard and logging dirs
++    desc = utils.get_desc(tag, FLAGS)
++    log_dir = utils.get_output_dir(FLAGS.logdir, desc)
++    os.makedirs(os.path.join(log_dir, 'sample'))
++
++    with open(os.path.join(log_dir, "flagfile.txt"), 'w') as f:
++        f.write(FLAGS.flags_into_string())
++
++    # draw some fake samples
++    sample_z = torch.randn(FLAGS.sample_size, FLAGS.z_dim).to(device)
++    outpath = os.path.join(log_dir, 'sample', f'generated.png')
++    write_samples(0, outpath, net_G, sample_z, None)
++
++    full_grad_G = extragradient.FullGradAcc()
++    full_grad_D = extragradient.FullGradAcc()
++
++    # run_loop(full_grad_G, full_grad_D)
++    run_loop(FLAGS, dataloader, loss_fn, net_G, net_D, acc_G=full_grad_G, acc_D=full_grad_D)
++
++    full_grad_G.save(os.path.join(log_dir, "full_grad_G.pth"))
++    full_grad_D.save(os.path.join(log_dir, "full_grad_D.pth"))
++    full_G, full_D = full_grad_G.get_average(), full_grad_D.get_average()
++
++    stoch_grad_G = extragradient.StochNoiseAcc(full_grad=full_G)
++    stoch_grad_D = extragradient.StochNoiseAcc(full_grad=full_D)
++
++    # run_loop(stoch_grad_G, stoch_grad_D)
++    run_loop(FLAGS, dataloader, loss_fn, net_G, net_D, acc_G=stoch_grad_G, acc_D=stoch_grad_D)
++
++    stoch_grad_G.save(os.path.join(log_dir, "stoch_noise_G.npy"))
++    stoch_grad_D.save(os.path.join(log_dir, "stoch_noise_D.npy"))
++
++    G_norm_diffs = stoch_grad_G.get()
++    D_norm_diffs = stoch_grad_D.get()
++
++    desc_str = f"{tag} {FLAGS.desc}"
++
++    norm = extragradient.plot_hists(G_norm_diffs, D_norm_diffs, desc_str, log=False)
++    norm.savefig(os.path.join(log_dir, "results_norm.png"), dpi=120)
++
++    log_norm = extragradient.plot_hists(G_norm_diffs, D_norm_diffs, desc_str, log=True)
++    log_norm.savefig(os.path.join(log_dir, "results_lognorm.png"), dpi=120)
+\ No newline at end of file
+diff --git a/source/extragradient.py b/source/extragradient.py
+new file mode 100644
+index 0000000..ba0b2f5
+--- /dev/null
++++ b/source/extragradient.py
+@@ -0,0 +1,426 @@
++#  MIT License
++
++# Permission is hereby granted, free of charge, to any person obtaining a copy
++# of this software and associated documentation files (the "Software"), to deal
++# in the Software without restriction, including without limitation the rights
++# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++# copies of the Software, and to permit persons to whom the Software is
++# furnished to do so, subject to the following conditions:
++
++# The above copyright notice and this permission notice shall be included in all
++# copies or substantial portions of the Software.
++
++# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++# SOFTWARE.
++
++import math
++import torch
++import numpy as np
++from torch.optim import Optimizer
++from abc import abstractmethod, ABC
++
++import matplotlib.pyplot as plt
++import seaborn as sns
++from scipy import stats
++
++sns.set()
++
++
++# --------------------------------------------------------------------------------------------------
++# Plots
++# --------------------------------------------------------------------------------------------------
++
++
++def _fit_normal(data, ax):
++    mu, std = stats.norm.fit(data)
++    xmin, xmax = ax.get_xlim()
++    x = np.linspace(xmin, xmax, 100)
++    p = stats.norm.pdf(x, mu, std)
++    return (x, p), (mu, std)
++
++
++def plot_hists(G, D, desc, log=False):
++    fig, axs = plt.subplots(1, 2, figsize=(12, 5))
++
++    title = f"{desc}"
++    if log:
++        title = f"{title} (log of norms)"
++
++    G = G.copy()
++    D = D.copy()
++    xlabel = r'$||g(x) - \nabla f_G(x)||_2$'
++
++    if log:
++        G = np.log(G)
++        D = np.log(D)
++        xlabel = f'$\log$({xlabel})'
++
++    ax = axs[0]
++    sns.histplot(G, ax=ax, stat="density")
++    ax.set(title='Generator Noise Norms')
++    ax.set_xlabel(xlabel)
++    
++    plot_args, (mu, std) = _fit_normal(G, ax)
++    ax.plot(*plot_args, 'k', linewidth=2)
++    ax.annotate(f'$\mu$: {mu.round(2)}, $\sigma$: {std.round(2)}', xy=(0.65, 0.95), xycoords='axes fraction')
++
++    ax = axs[1]
++    sns.histplot(D, ax=ax, stat="density")
++    ax.set(title='Discriminator Noise Norms')
++    ax.set_xlabel(xlabel)
++
++    plot_args, (mu, std) = _fit_normal(D, ax)
++    ax.plot(*plot_args, 'k', linewidth=2)
++    ax.annotate(f'$\mu$: {mu.round(2)}, $\sigma$: {std.round(2)}', xy=(0.65, 0.95), xycoords='axes fraction')
++    fig.suptitle(title, size=15)
++    return fig
++
++
++# --------------------------------------------------------------------------------------------------
++# Utils
++# --------------------------------------------------------------------------------------------------
++
++
++def get_clip_fn(mode: str, clip_max=None):
++    print(f"Clip mode: {mode}, max: {clip_max}")
++    kwargs = {}
++    if mode == "norm":
++        fn = torch.nn.utils.clip_grad.clip_grad_norm_
++        # params: max_norm, norm_type
++        kwargs['max_norm'] = clip_max
++
++    elif mode == "value":
++        fn = torch.nn.utils.clip_grad.clip_grad_value_
++        # params: clip_value
++        kwargs['clip_value'] = clip_max
++
++    else:
++        # no-op
++        fn = lambda x, **kwargs: None
++
++    def _clip_fn(parameters):
++        return fn(parameters, **kwargs)
++
++    return _clip_fn
++
++
++
++def get_batch_grad(model: torch.nn.Module) -> torch.Tensor:
++    """Returns a flattened 1d array of all the parameter gradients"""
++    gr = []
++    try:
++        for i in model.parameters():
++            if i.requires_grad:
++                gr.append(i.grad.detach().reshape(-1))
++        return torch.cat(gr)
++
++    except AttributeError as e:
++        print("Caught exception - returning None")
++        print(e)
++        return None
++
++class Acc(ABC):
++    @abstractmethod
++    def accumulate(self, module: torch.nn.Module, **kwargs):
++        pass
++
++    @abstractmethod
++    def save(self, path: str, **kwargs):
++        pass
++
++
++class StochNoiseAcc(ABC):
++    def __init__(self, full_grad: torch.Tensor):
++        self.full_grad = full_grad
++        self.stochastic_norms = []
++
++    def accumulate(self, module: torch.nn.Module):
++        grad = get_batch_grad(module)
++        if grad is not None:
++            self.stochastic_norms.append((grad - self.full_grad).norm().item())
++        
++    def get(self):
++        return np.array(self.stochastic_norms)
++    
++    def save(self, path):
++        np.save(path, np.array(self.stochastic_norms))
++
++
++class FullGradAcc(ABC):
++    def __init__(self):
++        self.grads = None
++        self.t = 0
++    
++    def accumulate(self, module: torch.nn.Module, batch_size: int = 1):
++        g = get_batch_grad(module)
++        if g is None:
++            print("warning: missing grads...?")
++            return 
++
++        if self.grads is None:
++            self.grads = g * batch_size
++        else:
++            self.grads += g * batch_size
++        self.t += 1
++    
++    def get_average(self, batch_size: int = 1) -> torch.Tensor:
++        if self.t == 0:
++            return None
++        return self.grads / (self.t * batch_size)
++
++    def reset(self):
++        self.grads = None
++        self.t = 0
++
++    def save(self, path: str, batch_size: int = 1):
++        torch.save(self.get_average(batch_size), path)
++
++
++# --------------------------------------------------------------------------------------------------
++# Optimizers
++# --------------------------------------------------------------------------------------------------
++
++required = object()
++
++class Extragradient(Optimizer):
++    """Base class for optimizers with extrapolation step.
++
++        Arguments:
++        params (iterable): an iterable of :class:`torch.Tensor` s or
++            :class:`dict` s. Specifies what Tensors should be optimized.
++        defaults: (dict): a dict containing default values of optimization
++            options (used when a parameter group doesn't specify them).
++    """
++    def __init__(self, params, defaults):
++        super(Extragradient, self).__init__(params, defaults)
++        self.params_copy = []
++
++    def update(self, p, group):
++        raise NotImplementedError
++
++    def extrapolation(self):
++        """Performs the extrapolation step and save a copy of the current parameters for the update step.
++        """
++        # Check if a copy of the parameters was already made.
++        is_empty = len(self.params_copy) == 0
++        for group in self.param_groups:
++            for p in group['params']:
++                u = self.update(p, group)
++                if is_empty:
++                    # Save the current parameters for the update step. Several extrapolation step can be made before each update but only the parameters before the first extrapolation step are saved.
++                    self.params_copy.append(p.data.clone())
++                if u is None:
++                    continue
++                # Update the current parameters
++                p.data.add_(u)
++
++    def step(self, closure=None):
++        """Performs a single optimization step.
++
++        Arguments:
++            closure (callable, optional): A closure that reevaluates the model
++                and returns the loss.
++        """
++        if len(self.params_copy) == 0:
++            raise RuntimeError('Need to call extrapolation before calling step.')
++
++        loss = None
++        if closure is not None:
++            loss = closure()
++
++        i = -1
++        for group in self.param_groups:
++            for p in group['params']:
++                i += 1
++                u = self.update(p, group)
++                if u is None:
++                    continue
++                # Update the parameters saved during the extrapolation step
++                p.data = self.params_copy[i].add_(u)
++
++
++        # Free the old parameters
++        self.params_copy = []
++        return loss
++
++class ExtraSGD(Extragradient):
++    """Implements stochastic gradient descent with extrapolation step (optionally with momentum).
++
++    Nesterov momentum is based on the formula from
++    `On the importance of initialization and momentum in deep learning`__.
++
++    Args:
++        params (iterable): iterable of parameters to optimize or dicts defining
++            parameter groups
++        lr (float): learning rate
++        momentum (float, optional): momentum factor (default: 0)
++        weight_decay (float, optional): weight decay (L2 penalty) (default: 0)
++        dampening (float, optional): dampening for momentum (default: 0)
++        nesterov (bool, optional): enables Nesterov momentum (default: False)
++
++    Example:
++        >>> optimizer = torch.optim.ExtraSGD(model.parameters(), lr=0.1, momentum=0.9)
++        >>> optimizer.zero_grad()
++        >>> loss_fn(model(input), target).backward()
++        >>> optimizer.extrapolation()
++        >>> optimizer.zero_grad()
++        >>> loss_fn(model(input), target).backward()
++        >>> optimizer.step()
++
++    __ http://www.cs.toronto.edu/%7Ehinton/absps/momentum.pdf
++
++    .. note::
++        The implementation of SGD with Momentum/Nesterov subtly differs from
++        Sutskever et. al. and implementations in some other frameworks.
++
++        Considering the specific case of Momentum, the update can be written as
++
++        .. math::
++                  v = \rho * v + g \\
++                  p = p - lr * v
++
++        where p, g, v and :math:`\rho` denote the parameters, gradient,
++        velocity, and momentum respectively.
++
++        This is in contrast to Sutskever et. al. and
++        other frameworks which employ an update of the form
++
++        .. math::
++             v = \rho * v + lr * g \\
++             p = p - v
++
++        The Nesterov version is analogously modified.
++    """
++    def __init__(self, params, lr=required, momentum=0, dampening=0,
++                 weight_decay=0, nesterov=False):
++        if lr is not required and lr < 0.0:
++            raise ValueError("Invalid learning rate: {}".format(lr))
++        if momentum < 0.0:
++            raise ValueError("Invalid momentum value: {}".format(momentum))
++        if weight_decay < 0.0:
++            raise ValueError("Invalid weight_decay value: {}".format(weight_decay))
++
++        defaults = dict(lr=lr, momentum=momentum, dampening=dampening,
++                        weight_decay=weight_decay, nesterov=nesterov)
++        if nesterov and (momentum <= 0 or dampening != 0):
++            raise ValueError("Nesterov momentum requires a momentum and zero dampening")
++        super(ExtraSGD, self).__init__(params, defaults)
++
++    def __setstate__(self, state):
++        super(ExtraSGD, self).__setstate__(state)
++        for group in self.param_groups:
++            group.setdefault('nesterov', False)
++
++    def update(self, p, group):
++        weight_decay = group['weight_decay']
++        momentum = group['momentum']
++        dampening = group['dampening']
++        nesterov = group['nesterov']
++
++        if p.grad is None:
++            return None
++        d_p = p.grad.data
++        if weight_decay != 0:
++            d_p.add_(weight_decay, p.data)
++        if momentum != 0:
++            param_state = self.state[p]
++            if 'momentum_buffer' not in param_state:
++                buf = param_state['momentum_buffer'] = torch.zeros_like(p.data)
++                buf.mul_(momentum).add_(d_p)
++            else:
++                buf = param_state['momentum_buffer']
++                buf.mul_(momentum).add_(1 - dampening, d_p)
++            if nesterov:
++                d_p = d_p.add(momentum, buf)
++            else:
++                d_p = buf
++
++        return -group['lr']*d_p
++
++class ExtraAdam(Extragradient):
++    """Implements the Adam algorithm with extrapolation step.
++
++    Arguments:
++        params (iterable): iterable of parameters to optimize or dicts defining
++            parameter groups
++        lr (float, optional): learning rate (default: 1e-3)
++        betas (Tuple[float, float], optional): coefficients used for computing
++            running averages of gradient and its square (default: (0.9, 0.999))
++        eps (float, optional): term added to the denominator to improve
++            numerical stability (default: 1e-8)
++        weight_decay (float, optional): weight decay (L2 penalty) (default: 0)
++        amsgrad (boolean, optional): whether to use the AMSGrad variant of this
++            algorithm from the paper `On the Convergence of Adam and Beyond`_
++    """
++
++    def __init__(self, params, lr=1e-3, betas=(0.9, 0.999), eps=1e-8,
++                 weight_decay=0, amsgrad=False):
++        if not 0.0 <= lr:
++         raise ValueError("Invalid learning rate: {}".format(lr))
++        if not 0.0 <= eps:
++         raise ValueError("Invalid epsilon value: {}".format(eps))
++        if not 0.0 <= betas[0] < 1.0:
++         raise ValueError("Invalid beta parameter at index 0: {}".format(betas[0]))
++        if not 0.0 <= betas[1] < 1.0:
++         raise ValueError("Invalid beta parameter at index 1: {}".format(betas[1]))
++        defaults = dict(lr=lr, betas=betas, eps=eps,
++                     weight_decay=weight_decay, amsgrad=amsgrad)
++        super(ExtraAdam, self).__init__(params, defaults)
++
++    def __setstate__(self, state):
++        super(ExtraAdam, self).__setstate__(state)
++        for group in self.param_groups:
++            group.setdefault('amsgrad', False)
++
++    def update(self, p, group):
++        if p.grad is None:
++            return None
++        grad = p.grad.data
++        if grad.is_sparse:
++            raise RuntimeError('Adam does not support sparse gradients, please consider SparseAdam instead')
++        amsgrad = group['amsgrad']
++
++        state = self.state[p]
++
++        # State initialization
++        if len(state) == 0:
++            state['step'] = 0
++            # Exponential moving average of gradient values
++            state['exp_avg'] = torch.zeros_like(p.data)
++            # Exponential moving average of squared gradient values
++            state['exp_avg_sq'] = torch.zeros_like(p.data)
++            if amsgrad:
++                # Maintains max of all exp. moving avg. of sq. grad. values
++                state['max_exp_avg_sq'] = torch.zeros_like(p.data)
++
++        exp_avg, exp_avg_sq = state['exp_avg'], state['exp_avg_sq']
++        if amsgrad:
++            max_exp_avg_sq = state['max_exp_avg_sq']
++        beta1, beta2 = group['betas']
++
++        state['step'] += 1
++
++        if group['weight_decay'] != 0:
++            grad = grad.add(group['weight_decay'], p.data)
++
++        # Decay the first and second moment running average coefficient
++        exp_avg.mul_(beta1).add_(1 - beta1, grad)
++        exp_avg_sq.mul_(beta2).addcmul_(1 - beta2, grad, grad)
++        if amsgrad:
++            # Maintains the maximum of all 2nd moment running avg. till now
++            torch.max(max_exp_avg_sq, exp_avg_sq, out=max_exp_avg_sq)
++            # Use the max. for normalizing running avg. of gradient
++            denom = max_exp_avg_sq.sqrt().add_(group['eps'])
++        else:
++            denom = exp_avg_sq.sqrt().add_(group['eps'])
++
++        bias_correction1 = 1 - beta1 ** state['step']
++        bias_correction2 = 1 - beta2 ** state['step']
++        step_size = group['lr'] * math.sqrt(bias_correction2) / bias_correction1
++
++        return -step_size*exp_avg/denom
+diff --git a/source/models/__init__.py b/source/models/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/source/models/wgangp.py b/source/models/wgangp.py
+index 617c530..3dd7cd4 100644
+--- a/source/models/wgangp.py
++++ b/source/models/wgangp.py
+@@ -123,20 +123,21 @@ class ResGenBlock(nn.Module):
+ 
+ 
+ class ResGenerator32(nn.Module):
+-    def __init__(self, z_dim):
++    def __init__(self, z_dim, internal_dim=256):
+         super().__init__()
++        self._h = internal_dim
+         self.z_dim = z_dim
+-        self.linear = nn.Linear(z_dim, 4 * 4 * 256)
++        self.linear = nn.Linear(z_dim, 4 * 4 * self._h)
+ 
+         self.blocks = nn.Sequential(
+-            ResGenBlock(256, 256),
+-            ResGenBlock(256, 256),
+-            ResGenBlock(256, 256),
++            ResGenBlock(self._h, self._h),
++            ResGenBlock(self._h, self._h),
++            ResGenBlock(self._h, self._h),
+         )
+         self.output = nn.Sequential(
+-            nn.BatchNorm2d(256),
++            nn.BatchNorm2d(self._h),
+             nn.ReLU(True),
+-            nn.Conv2d(256, 3, 3, stride=1, padding=1),
++            nn.Conv2d(self._h, 3, 3, stride=1, padding=1),
+             nn.Tanh(),
+         )
+         self.initialize()
+@@ -151,7 +152,7 @@ class ResGenerator32(nn.Module):
+ 
+     def forward(self, z):
+         z = self.linear(z)
+-        z = z.view(-1, 256, 4, 4)
++        z = z.view(-1, self._h, 4, 4)
+         return self.output(self.blocks(z))
+ 
+ 
+@@ -237,3 +238,103 @@ class ResDiscriminator32(nn.Module):
+         x = self.model(x).sum(dim=[2, 3])
+         x = self.linear(x)
+         return x
++
++
++
++"""
++
++def ConvMeanPool(name, input_dim, output_dim, filter_size, inputs, he_init=True, biases=True):
++    output = lib.ops.conv2d.Conv2D(name, input_dim, output_dim, filter_size, inputs, he_init=he_init, biases=biases)
++    output = tf.add_n([output[:,:,::2,::2], output[:,:,1::2,::2], output[:,:,::2,1::2], output[:,:,1::2,1::2]]) / 4.
++    return output
++
++def MeanPoolConv(name, input_dim, output_dim, filter_size, inputs, he_init=True, biases=True):
++    output = inputs
++    output = tf.add_n([output[:,:,::2,::2], output[:,:,1::2,::2], output[:,:,::2,1::2], output[:,:,1::2,1::2]]) / 4.
++    output = lib.ops.conv2d.Conv2D(name, input_dim, output_dim, filter_size, output, he_init=he_init, biases=biases)
++    return output
++
++def UpsampleConv(name, input_dim, output_dim, filter_size, inputs, he_init=True, biases=True):
++    output = inputs
++    output = tf.concat([output, output, output, output], axis=1)
++    output = tf.transpose(output, [0,2,3,1])
++    output = tf.depth_to_space(output, 2)
++    output = tf.transpose(output, [0,3,1,2])
++    output = lib.ops.conv2d.Conv2D(name, input_dim, output_dim, filter_size, output, he_init=he_init, biases=biases)
++    return output
++
++def ResidualBlock(name, input_dim, output_dim, filter_size, inputs, resample=None, no_dropout=False, labels=None):
++    # resample: None, 'down', or 'up'
++    if resample=='down':
++        conv_1        = functools.partial(lib.ops.conv2d.Conv2D, input_dim=input_dim, output_dim=input_dim)
++        conv_2        = functools.partial(ConvMeanPool, input_dim=input_dim, output_dim=output_dim)
++        conv_shortcut = ConvMeanPool
++    elif resample=='up':
++        conv_1        = functools.partial(UpsampleConv, input_dim=input_dim, output_dim=output_dim)
++        conv_shortcut = UpsampleConv
++        conv_2        = functools.partial(lib.ops.conv2d.Conv2D, input_dim=output_dim, output_dim=output_dim)
++    elif resample==None:
++        conv_shortcut = lib.ops.conv2d.Conv2D
++        conv_1        = functools.partial(lib.ops.conv2d.Conv2D, input_dim=input_dim, output_dim=output_dim)
++        conv_2        = functools.partial(lib.ops.conv2d.Conv2D, input_dim=output_dim, output_dim=output_dim)
++    else:
++        raise Exception('invalid resample value')
++
++    if output_dim==input_dim and resample==None:
++        shortcut = inputs # Identity skip-connection
++    else:
++        shortcut = conv_shortcut(name+'.Shortcut', input_dim=input_dim, output_dim=output_dim, filter_size=1, he_init=False, biases=True, inputs=inputs)
++
++    output = inputs
++    output = Normalize(name+'.N1', output, labels=labels)
++    output = nonlinearity(output)
++    output = conv_1(name+'.Conv1', filter_size=filter_size, inputs=output)    
++    output = Normalize(name+'.N2', output, labels=labels)
++    output = nonlinearity(output)            
++    output = conv_2(name+'.Conv2', filter_size=filter_size, inputs=output)
++
++    return shortcut + output
++
++def OptimizedResBlockDisc1(inputs):
++    conv_1        = functools.partial(lib.ops.conv2d.Conv2D, input_dim=3, output_dim=DIM_D)
++    conv_2        = functools.partial(ConvMeanPool, input_dim=DIM_D, output_dim=DIM_D)
++    conv_shortcut = MeanPoolConv
++    shortcut = conv_shortcut('Discriminator.1.Shortcut', input_dim=3, output_dim=DIM_D, filter_size=1, he_init=False, biases=True, inputs=inputs)
++
++    output = inputs
++    output = conv_1('Discriminator.1.Conv1', filter_size=3, inputs=output)    
++    output = nonlinearity(output)            
++    output = conv_2('Discriminator.1.Conv2', filter_size=3, inputs=output)
++    return shortcut + output
++
++def Generator(n_samples, labels, noise=None):
++    if noise is None:
++        noise = tf.random_normal([n_samples, 128])
++    output = lib.ops.linear.Linear('Generator.Input', 128, 4*4*DIM_G, noise)
++    output = tf.reshape(output, [-1, DIM_G, 4, 4])
++    output = ResidualBlock('Generator.1', DIM_G, DIM_G, 3, output, resample='up', labels=labels)
++    output = ResidualBlock('Generator.2', DIM_G, DIM_G, 3, output, resample='up', labels=labels)
++    output = ResidualBlock('Generator.3', DIM_G, DIM_G, 3, output, resample='up', labels=labels)
++    output = Normalize('Generator.OutputN', output)
++    output = nonlinearity(output)
++    output = lib.ops.conv2d.Conv2D('Generator.Output', DIM_G, 3, 3, output, he_init=False)
++    output = tf.tanh(output)
++    return tf.reshape(output, [-1, OUTPUT_DIM])
++
++def Discriminator(inputs, labels):
++    output = tf.reshape(inputs, [-1, 3, 32, 32])
++    output = OptimizedResBlockDisc1(output)
++    output = ResidualBlock('Discriminator.2', DIM_D, DIM_D, 3, output, resample='down', labels=labels)
++    output = ResidualBlock('Discriminator.3', DIM_D, DIM_D, 3, output, resample=None, labels=labels)
++    output = ResidualBlock('Discriminator.4', DIM_D, DIM_D, 3, output, resample=None, labels=labels)
++    output = nonlinearity(output)
++    output = tf.reduce_mean(output, axis=[2,3])
++    output_wgan = lib.ops.linear.Linear('Discriminator.Output', DIM_D, 1, output)
++    output_wgan = tf.reshape(output_wgan, [-1])
++    if CONDITIONAL and ACGAN:
++        output_acgan = lib.ops.linear.Linear('Discriminator.ACGANOutput', DIM_D, 10, output)
++        return output_wgan, output_acgan
++    else:
++        return output_wgan, None
++
++"""
+\ No newline at end of file
+diff --git a/source/utils.py b/source/utils.py
+index 0397fbc..ddc7650 100644
+--- a/source/utils.py
++++ b/source/utils.py
+@@ -3,6 +3,8 @@ import random
+ import torch
+ import numpy as np
+ from tqdm import trange
++import os
++import re
+ 
+ 
+ def generate_imgs(net_G, device, z_dim=128, size=5000, batch_size=128):
+@@ -33,3 +35,27 @@ def set_seed(seed):
+     torch.cuda.manual_seed(seed)
+     # torch.backends.cudnn.deterministic = True
+     # torch.backends.cudnn.benchmark = False
++
++
++def get_desc(model: str, opts) -> str:
++    _clip_desc = ""
++    if opts.clip_mode in ['norm', 'value']:
++        _clip_desc = f"-{opts.clip_mode}-g{opts.clip_G}-d{opts.clip_D}"
++    desc = f'{model}-{opts.opt}{_clip_desc}-dlr{opts.lr_D}-glr{opts.lr_G}'
++    if opts.desc is not None:
++        desc += f'-{opts.desc}'
++    return desc
++
++
++def get_output_dir(outdir: str, desc: str) -> str:
++    # Pick output directory.
++    prev_run_dirs = []
++    if os.path.isdir(outdir):
++        prev_run_dirs = [x for x in os.listdir(outdir) if os.path.isdir(os.path.join(outdir, x))]
++    prev_run_ids = [re.match(r'^\d+', x) for x in prev_run_dirs]
++    prev_run_ids = [int(x.group()) for x in prev_run_ids if x is not None]
++    cur_run_id = max(prev_run_ids, default=-1) + 1
++    run_dir = os.path.join(outdir, f'{cur_run_id:05d}-{desc}')
++    print(f"Output dir: {run_dir}")
++    assert not os.path.exists(run_dir)
++    return run_dir
+\ No newline at end of file
+diff --git a/wgan.py b/wgan.py
+deleted file mode 100644
+index 2f70d24..0000000
+--- a/wgan.py
++++ /dev/null
+@@ -1,209 +0,0 @@
+-import os
+-
+-import torch
+-import torch.optim as optim
+-from absl import flags, app
+-from torchvision import datasets, transforms
+-from torchvision.utils import make_grid, save_image
+-from tensorboardX import SummaryWriter
+-from tqdm import trange
+-from pytorch_gan_metrics import get_inception_score_and_fid
+-
+-import source.models.wgangp as models
+-import source.losses as losses
+-from source.utils import generate_imgs, infiniteloop, set_seed
+-
+-
+-net_G_models = {
+-    'res32': models.ResGenerator32,
+-    'cnn32': models.Generator32,
+-}
+-
+-net_D_models = {
+-    'res32': models.ResDiscriminator32,
+-    'cnn32': models.Discriminator32,
+-}
+-
+-loss_fns = {
+-    'bce': losses.BCEWithLogits,
+-    'hinge': losses.Hinge,
+-    'was': losses.Wasserstein,
+-    'softplus': losses.Softplus
+-}
+-
+-FLAGS = flags.FLAGS
+-# model and training
+-flags.DEFINE_enum('dataset', 'cifar10', ['cifar10', 'stl10'], "dataset")
+-flags.DEFINE_enum('arch', 'cnn32', net_G_models.keys(), "architecture")
+-flags.DEFINE_integer('total_steps', 100000, "total number of training steps")
+-flags.DEFINE_integer('batch_size', 128, "batch size")
+-flags.DEFINE_float('lr_G', 2e-4, "Generator learning rate")
+-flags.DEFINE_float('lr_D', 2e-4, "Discriminator learning rate")
+-flags.DEFINE_multi_float('betas', [0.0, 0.9], "for Adam")
+-flags.DEFINE_integer('n_dis', 5, "update Generator every this steps")
+-flags.DEFINE_integer('z_dim', 128, "latent space dimension")
+-flags.DEFINE_float('c', 0.1, "clip value")
+-flags.DEFINE_enum('loss', 'was', loss_fns.keys(), "loss function")
+-flags.DEFINE_integer('seed', 0, "random seed")
+-# logging
+-flags.DEFINE_integer('eval_step', 5000, "evaluate FID and Inception Score")
+-flags.DEFINE_integer('sample_step', 500, "sample image every this steps")
+-flags.DEFINE_integer('sample_size', 64, "sampling size of images")
+-flags.DEFINE_string('logdir', './logs/WGAN_CIFAR10_CNN', 'logging folder')
+-flags.DEFINE_bool('record', True, "record inception score and FID")
+-flags.DEFINE_string('fid_cache', './stats/cifar10.train.npz', 'FID cache')
+-# generate
+-flags.DEFINE_bool('generate', False, 'generate images')
+-flags.DEFINE_string('pretrain', None, 'path to test model')
+-flags.DEFINE_string('output', './outputs', 'path to output dir')
+-flags.DEFINE_integer('num_images', 50000, 'the number of generated images')
+-
+-device = torch.device('cuda:0')
+-
+-
+-def generate():
+-    assert FLAGS.pretrain is not None, "set model weight by --pretrain [model]"
+-
+-    net_G = net_G_models[FLAGS.arch](FLAGS.z_dim).to(device)
+-    net_G.load_state_dict(torch.load(FLAGS.pretrain)['net_G'])
+-    net_G.eval()
+-
+-    counter = 0
+-    os.makedirs(FLAGS.output)
+-    with torch.no_grad():
+-        for start in trange(
+-                0, FLAGS.num_images, FLAGS.batch_size, dynamic_ncols=True):
+-            batch_size = min(FLAGS.batch_size, FLAGS.num_images - start)
+-            z = torch.randn(batch_size, FLAGS.z_dim).to(device)
+-            x = net_G(z).cpu()
+-            x = (x + 1) / 2
+-            for image in x:
+-                save_image(
+-                    image, os.path.join(FLAGS.output, '%d.png' % counter))
+-                counter += 1
+-
+-
+-def train():
+-    if FLAGS.dataset == 'cifar10':
+-        dataset = datasets.CIFAR10(
+-            './data', train=True, download=True,
+-            transform=transforms.Compose([
+-                transforms.RandomHorizontalFlip(),
+-                transforms.ToTensor(),
+-                transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+-            ]))
+-    if FLAGS.dataset == 'stl10':
+-        dataset = datasets.STL10(
+-            './data', split='unlabeled', download=True,
+-            transform=transforms.Compose([
+-                transforms.Resize((48, 48)),
+-                transforms.RandomHorizontalFlip(),
+-                transforms.ToTensor(),
+-                transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+-            ]))
+-
+-    dataloader = torch.utils.data.DataLoader(
+-        dataset, batch_size=FLAGS.batch_size, shuffle=True, num_workers=4,
+-        drop_last=True)
+-
+-    net_G = net_G_models[FLAGS.arch](FLAGS.z_dim).to(device)
+-    net_D = net_D_models[FLAGS.arch]().to(device)
+-    loss_fn = loss_fns[FLAGS.loss]()
+-
+-    optim_G = optim.Adam(net_G.parameters(), lr=FLAGS.lr_G, betas=FLAGS.betas)
+-    optim_D = optim.Adam(net_D.parameters(), lr=FLAGS.lr_D, betas=FLAGS.betas)
+-    sched_G = optim.lr_scheduler.LambdaLR(
+-        optim_G, lambda step: 1 - step / FLAGS.total_steps)
+-    sched_D = optim.lr_scheduler.LambdaLR(
+-        optim_D, lambda step: 1 - step / FLAGS.total_steps)
+-
+-    os.makedirs(os.path.join(FLAGS.logdir, 'sample'))
+-    writer = SummaryWriter(os.path.join(FLAGS.logdir))
+-    sample_z = torch.randn(FLAGS.sample_size, FLAGS.z_dim).to(device)
+-    with open(os.path.join(FLAGS.logdir, "flagfile.txt"), 'w') as f:
+-        f.write(FLAGS.flags_into_string())
+-    writer.add_text(
+-        "flagfile", FLAGS.flags_into_string().replace('\n', '  \n'))
+-
+-    real, _ = next(iter(dataloader))
+-    grid = (make_grid(real[:FLAGS.sample_size]) + 1) / 2
+-    writer.add_image('real_sample', grid)
+-
+-    looper = infiniteloop(dataloader)
+-    with trange(1, FLAGS.total_steps + 1, desc='Training', ncols=0) as pbar:
+-        for step in pbar:
+-            # Discriminator
+-            for _ in range(FLAGS.n_dis):
+-                with torch.no_grad():
+-                    z = torch.randn(FLAGS.batch_size, FLAGS.z_dim).to(device)
+-                    fake = net_G(z).detach()
+-                real = next(looper).to(device)
+-                net_D_real = net_D(real)
+-                net_D_fake = net_D(fake)
+-                loss = loss_fn(net_D_real, net_D_fake)
+-
+-                optim_D.zero_grad()
+-                loss.backward()
+-                optim_D.step()
+-
+-                for p in net_D.parameters():
+-                    p.data.clamp_(-FLAGS.c, FLAGS.c)
+-
+-                if FLAGS.loss == 'was':
+-                    loss = -loss
+-                pbar.set_postfix(loss='%.4f' % loss)
+-            writer.add_scalar('loss', loss, step)
+-
+-            # Generator
+-            z = torch.randn(FLAGS.batch_size * 2, FLAGS.z_dim).to(device)
+-            loss = loss_fn(net_D(net_G(z)))
+-
+-            optim_G.zero_grad()
+-            loss.backward()
+-            optim_G.step()
+-
+-            sched_G.step()
+-            sched_D.step()
+-
+-            if step == 1 or step % FLAGS.sample_step == 0:
+-                fake = net_G(sample_z).cpu()
+-                grid = (make_grid(fake) + 1) / 2
+-                writer.add_image('sample', grid, step)
+-                save_image(grid, os.path.join(
+-                    FLAGS.logdir, 'sample', '%d.png' % step))
+-
+-            if step == 1 or step % FLAGS.eval_step == 0:
+-                torch.save({
+-                    'net_G': net_G.state_dict(),
+-                    'net_D': net_D.state_dict(),
+-                    'optim_G': optim_G.state_dict(),
+-                    'optim_D': optim_D.state_dict(),
+-                    'sched_G': sched_G.state_dict(),
+-                    'sched_D': sched_D.state_dict(),
+-                }, os.path.join(FLAGS.logdir, 'model.pt'))
+-                if FLAGS.record:
+-                    imgs = generate_imgs(
+-                        net_G, device, FLAGS.z_dim,
+-                        FLAGS.num_images, FLAGS.batch_size)
+-                    IS, FID = get_inception_score_and_fid(
+-                        imgs, FLAGS.fid_cache, verbose=True)
+-                    pbar.write(
+-                        "%s/%s Inception Score: %.3f(%.5f), "
+-                        "FID: %6.3f" % (
+-                            step, FLAGS.total_steps, IS[0], IS[1], FID))
+-                    writer.add_scalar('Inception_Score', IS[0], step)
+-                    writer.add_scalar('Inception_Score_std', IS[1], step)
+-                    writer.add_scalar('FID', FID, step)
+-    writer.close()
+-
+-
+-def main(argv):
+-    set_seed(FLAGS.seed)
+-    if FLAGS.generate:
+-        generate()
+-    else:
+-        train()
+-
+-
+-if __name__ == '__main__':
+-    app.run(main)
+diff --git a/wgangp.py b/wgangp.py
+index ee8805c..b793b9b 100644
+--- a/wgangp.py
++++ b/wgangp.py
+@@ -5,13 +5,15 @@ import torch.optim as optim
+ from absl import flags, app
+ from torchvision import datasets, transforms
+ from torchvision.utils import make_grid, save_image
+-from tensorboardX import SummaryWriter
+ from tqdm import trange
+-from pytorch_gan_metrics import get_inception_score_and_fid
+ 
+ import source.models.wgangp as models
+-import source.losses as losses
+-from source.utils import generate_imgs, infiniteloop, set_seed
++from source.utils import infiniteloop, set_seed
++
++from source import extragradient
++from source import losses
++from source import utils
++from source import common
+ 
+ 
+ net_G_models = {
+@@ -31,20 +33,40 @@ loss_fns = {
+     'softplus': losses.Softplus
+ }
+ 
++optimizers = {
++    'adam': torch.optim.Adam,
++    'sgd': torch.optim.SGD,
++    'extraadam': extragradient.ExtraAdam,
++    'extrasgd': extragradient.ExtraSGD
++}
++
+ FLAGS = flags.FLAGS
+ # model and training
+ flags.DEFINE_enum('dataset', 'cifar10', ['cifar10', 'stl10'], "dataset")
++flags.DEFINE_string('data_dir', "./data", "dataset directory")
+ flags.DEFINE_enum('arch', 'res32', net_G_models.keys(), "architecture")
+ flags.DEFINE_integer('total_steps', 100000, "total number of training steps")
+ flags.DEFINE_integer('batch_size', 64, "batch size")
++flags.DEFINE_integer('G_dim', 256, "generator internal dim (default should be 128, but sngan is 256")
++
++flags.DEFINE_bool('evaluate', False, 'Eval and generate stochastic histograms')
++
++# optimizers
++flags.DEFINE_enum('opt', 'adam', optimizers.keys(), "optimizer")
+ flags.DEFINE_float('lr_G', 2e-4, "Generator learning rate")
+ flags.DEFINE_float('lr_D', 2e-4, "Discriminator learning rate")
+-flags.DEFINE_multi_float('betas', [0.0, 0.9], "for Adam")
++flags.DEFINE_multi_float('betas', [0.0, 0.9], "for adam")
++
++flags.DEFINE_enum('clip_mode', 'none', ['none', 'value', 'norm'], 'Clipping type')
++flags.DEFINE_float('clip_G', None, 'Generator max clip')
++flags.DEFINE_float('clip_D', None, 'Discriminator max clip')
++
+ flags.DEFINE_integer('n_dis', 5, "update Generator every this steps")
+ flags.DEFINE_integer('z_dim', 128, "latent space dimension")
+ flags.DEFINE_float('alpha', 10, "gradient penalty")
+ flags.DEFINE_enum('loss', 'was', loss_fns.keys(), "loss function")
+ flags.DEFINE_integer('seed', 0, "random seed")
++
+ # logging
+ flags.DEFINE_integer('eval_step', 5000, "evaluate FID and Inception Score")
+ flags.DEFINE_integer('sample_step', 500, "sample image every this steps")
+@@ -52,8 +74,11 @@ flags.DEFINE_integer('sample_size', 64, "sampling size of images")
+ flags.DEFINE_string('logdir', './logs/WGANGP_CIFAR10_RES', 'logging folder')
+ flags.DEFINE_bool('record', True, "record inception score and FID")
+ flags.DEFINE_string('fid_cache', './stats/cifar10.train.npz', 'FID cache')
++flags.DEFINE_string('desc', None, 'Extra description string')
++
+ # generate
+ flags.DEFINE_bool('generate', False, 'generate images')
++flags.DEFINE_bool('generate_grid', False, 'generate images in a grid')
+ flags.DEFINE_string('pretrain', None, 'path to test model')
+ flags.DEFINE_string('output', './outputs', 'path to output dir')
+ flags.DEFINE_integer('num_images', 50000, 'the number of generated images')
+@@ -61,28 +86,6 @@ flags.DEFINE_integer('num_images', 50000, 'the number of generated images')
+ device = torch.device('cuda:0')
+ 
+ 
+-def generate():
+-    assert FLAGS.pretrain is not None, "set model weight by --pretrain [model]"
+-
+-    net_G = net_G_models[FLAGS.arch](FLAGS.z_dim).to(device)
+-    net_G.load_state_dict(torch.load(FLAGS.pretrain)['net_G'])
+-    net_G.eval()
+-
+-    counter = 0
+-    os.makedirs(FLAGS.output)
+-    with torch.no_grad():
+-        for start in trange(
+-                0, FLAGS.num_images, FLAGS.batch_size, dynamic_ncols=True):
+-            batch_size = min(FLAGS.batch_size, FLAGS.num_images - start)
+-            z = torch.randn(batch_size, FLAGS.z_dim).to(device)
+-            x = net_G(z).cpu()
+-            x = (x + 1) / 2
+-            for image in x:
+-                save_image(
+-                    image, os.path.join(FLAGS.output, '%d.png' % counter))
+-                counter += 1
+-
+-
+ def cacl_gradient_penalty(net_D, real, fake):
+     t = torch.rand(real.size(0), 1, 1, 1).to(real.device)
+     t = t.expand(real.size())
+@@ -100,53 +103,83 @@ def cacl_gradient_penalty(net_D, real, fake):
+     return loss_gp
+ 
+ 
++def eval_run_loop(
++    FLAGS: flags.FLAGS, 
++    dataloader: torch.utils.data.DataLoader,
++    loss_fn: callable,
++    net_G: torch.nn.Module,
++    net_D: torch.nn.Module,
++    acc_G: extragradient.Acc, 
++    acc_D: extragradient.Acc,
++):
++    looper = infiniteloop(dataloader)
++    with trange(1, FLAGS.total_steps + 1, desc='Eval', ncols=0) as pbar:
++        for step in pbar:
++            # Discriminator
++            for _ in range(FLAGS.n_dis):
++                with torch.no_grad():
++                    z = torch.randn(FLAGS.batch_size, FLAGS.z_dim).to(device)
++                    fake = net_G(z).detach()
++                real = next(looper).to(device)
++                net_D_real = net_D(real)
++                net_D_fake = net_D(fake)
++                loss = loss_fn(net_D_real, net_D_fake)
++                loss_gp = cacl_gradient_penalty(net_D, real, fake)
++                loss_all = loss + FLAGS.alpha * loss_gp
++
++                net_D.zero_grad()
++                loss_all.backward()
++                acc_D.accumulate(net_D)
++
++                if FLAGS.loss == 'was':
++                    loss = -loss
++                pbar.set_postfix(loss='%.4f' % loss)
++
++            # Generator
++            # reduce memory usage
++            for p in net_D.parameters():
++                p.requires_grad_(False)
++
++            z = torch.randn(FLAGS.batch_size * 2, FLAGS.z_dim).to(device)
++            loss = loss_fn(net_D(net_G(z)))
++
++            net_G.zero_grad()
++            loss.backward()
++            acc_G.accumulate(net_G)
++
++            for p in net_D.parameters():
++                p.requires_grad_(True)
++
++
+ def train():
+-    if FLAGS.dataset == 'cifar10':
+-        dataset = datasets.CIFAR10(
+-            './data', train=True, download=True,
+-            transform=transforms.Compose([
+-                transforms.RandomHorizontalFlip(),
+-                transforms.ToTensor(),
+-                transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+-            ]))
+-    if FLAGS.dataset == 'stl10':
+-        dataset = datasets.STL10(
+-            './data', split='unlabeled', download=True,
+-            transform=transforms.Compose([
+-                transforms.Resize((48, 48)),
+-                transforms.RandomHorizontalFlip(),
+-                transforms.ToTensor(),
+-                transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+-            ]))
+-
+-    dataloader = torch.utils.data.DataLoader(
+-        dataset, batch_size=FLAGS.batch_size, shuffle=True, num_workers=4,
+-        drop_last=True)
+-
+-    net_G = net_G_models[FLAGS.arch](FLAGS.z_dim).to(device)
++    dataset, dataloader = common.init_dataloaders(FLAGS)
++
++    net_G = net_G_models[FLAGS.arch](FLAGS.z_dim, FLAGS.G_dim).to(device)
+     net_D = net_D_models[FLAGS.arch]().to(device)
+     loss_fn = loss_fns[FLAGS.loss]()
+ 
+-    optim_G = optim.Adam(net_G.parameters(), lr=FLAGS.lr_G, betas=FLAGS.betas)
+-    optim_D = optim.Adam(net_D.parameters(), lr=FLAGS.lr_D, betas=FLAGS.betas)
+-    sched_G = optim.lr_scheduler.LambdaLR(
+-        optim_G, lambda step: 1 - step / FLAGS.total_steps)
+-    sched_D = optim.lr_scheduler.LambdaLR(
+-        optim_D, lambda step: 1 - step / FLAGS.total_steps)
++    optim_G, optim_D, sched_G, sched_D = common.init_optimizers(FLAGS, optimizers, net_G, net_D)
++    clip_G, clip_D = common.init_clip_fns(FLAGS) # returns no-op if clip_mode is None
++
++    is_extra = isinstance(optim_G, extragradient.Extragradient)
++
++    if FLAGS.desc is None:
++        FLAGS.desc = f"a{FLAGS.alpha}"
++    else:
++        FLAGS.desc = f"a{FLAGS.alpha}-{FLAGS.desc}"
++    desc = utils.get_desc("WGANGP", FLAGS)
++    log_dir = utils.get_output_dir(FLAGS.logdir, desc)
++    os.makedirs(os.path.join(log_dir, 'sample'))
+ 
+-    os.makedirs(os.path.join(FLAGS.logdir, 'sample'))
+-    writer = SummaryWriter(os.path.join(FLAGS.logdir))
++    writer = common.init_tensorboard(FLAGS, log_dir, device)
+     sample_z = torch.randn(FLAGS.sample_size, FLAGS.z_dim).to(device)
+-    with open(os.path.join(FLAGS.logdir, "flagfile.txt"), 'w') as f:
+-        f.write(FLAGS.flags_into_string())
+-    writer.add_text(
+-        "flagfile", FLAGS.flags_into_string().replace('\n', '  \n'))
+ 
+     real, _ = next(iter(dataloader))
+     grid = (make_grid(real[:FLAGS.sample_size]) + 1) / 2
+     writer.add_image('real_sample', grid)
+ 
+     looper = infiniteloop(dataloader)
++    step_disc = 1
+     with trange(1, FLAGS.total_steps + 1, desc='Training', ncols=0) as pbar:
+         for step in pbar:
+             # Discriminator
+@@ -163,11 +196,18 @@ def train():
+ 
+                 optim_D.zero_grad()
+                 loss_all.backward()
+-                optim_D.step()
++
++                clip_D(net_D.parameters())  # clip gradients
++                if is_extra and step_disc % 2 != 0:
++                    optim_D.extrapolation()
++                else:
++                    optim_D.step()
++                step_disc += 1
+ 
+                 if FLAGS.loss == 'was':
+                     loss = -loss
+                 pbar.set_postfix(loss='%.4f' % loss)
++
+             writer.add_scalar('loss', loss, step)
+             writer.add_scalar('loss_gp', loss_gp, step)
+ 
+@@ -175,12 +215,18 @@ def train():
+             for p in net_D.parameters():
+                 # reduce memory usage
+                 p.requires_grad_(False)
++
+             z = torch.randn(FLAGS.batch_size * 2, FLAGS.z_dim).to(device)
+-            loss = loss_fn(net_D(net_G(z)))
++            loss_G = loss_fn(net_D(net_G(z)))
+ 
+             optim_G.zero_grad()
+-            loss.backward()
+-            optim_G.step()
++            loss_G.backward()
++            clip_G(net_G.parameters())  # clip gradients
++            if is_extra and step % 2 != 0:
++                optim_G.extrapolation()
++            else:
++                optim_G.step()
++
+             for p in net_D.parameters():
+                 p.requires_grad_(True)
+ 
+@@ -188,41 +234,47 @@ def train():
+             sched_D.step()
+ 
+             if step == 1 or step % FLAGS.sample_step == 0:
+-                fake = net_G(sample_z).cpu()
+-                grid = (make_grid(fake) + 1) / 2
+-                writer.add_image('sample', grid, step)
+-                save_image(grid, os.path.join(
+-                    FLAGS.logdir, 'sample', '%d.png' % step))
++                outpath = os.path.join(log_dir, 'sample', f'{step}.png')
++                common.write_samples(step, outpath, net_G, sample_z, writer)
+ 
+             if step == 1 or step % FLAGS.eval_step == 0:
+-                torch.save({
+-                    'net_G': net_G.state_dict(),
+-                    'net_D': net_D.state_dict(),
+-                    'optim_G': optim_G.state_dict(),
+-                    'optim_D': optim_D.state_dict(),
+-                    'sched_G': sched_G.state_dict(),
+-                    'sched_D': sched_D.state_dict(),
+-                }, os.path.join(FLAGS.logdir, 'model.pt'))
++                common.checkpoint(log_dir, step, net_G, net_D, optim_G, optim_D, sched_G, sched_D)
++
+                 if FLAGS.record:
+-                    imgs = generate_imgs(
+-                        net_G, device, FLAGS.z_dim,
+-                        FLAGS.num_images, FLAGS.batch_size)
+-                    IS, FID = get_inception_score_and_fid(
+-                        imgs, FLAGS.fid_cache, verbose=True)
++                    IS, FID = common.eval_metrics(FLAGS, net_G, device)
+                     pbar.write(
+-                        "%s/%s Inception Score: %.3f(%.5f), "
+-                        "FID: %6.3f" % (
+-                            step, FLAGS.total_steps, IS[0], IS[1], FID))
++                        "%s/%s Inception Score: %.3f(%.5f), FID: %6.3f" 
++                        % (step, FLAGS.total_steps, IS[0], IS[1], FID)
++                    )
+                     writer.add_scalar('Inception_Score', IS[0], step)
+                     writer.add_scalar('Inception_Score_std', IS[1], step)
+                     writer.add_scalar('FID', FID, step)
++
++            if loss_G.isnan().item() or loss_all.isnan().item():
++                print("Error: nan loss!")
++                break
++
+     writer.close()
+ 
+ 
+ def main(argv):
+     set_seed(FLAGS.seed)
+     if FLAGS.generate:
+-        generate()
++        common.generate(FLAGS=FLAGS, net_G_models=net_G_models, device=device)
++
++    elif FLAGS.evaluate:
++        if FLAGS.G_dim != 256:
++            raise NotImplementedError
++        common.evaluate(
++            FLAGS=FLAGS, 
++            run_loop=eval_run_loop,
++            net_G_models=net_G_models,
++            net_D_models=net_D_models,
++            loss_fns=loss_fns,
++            tag="WGANGP",
++            device=device,
++        )
++
+     else:
+         train()
+ 

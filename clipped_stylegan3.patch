@@ -1,0 +1,2395 @@
+diff --git a/environment.yml b/environment.yml
+index 578a58a..31b3715 100644
+--- a/environment.yml
++++ b/environment.yml
+@@ -16,6 +16,7 @@ dependencies:
+   - ninja=1.10.2
+   - matplotlib=3.4.2
+   - imageio=2.9.0
++  - seaborn
+   - pip:
+     - imgui==1.3.0
+     - glfw==2.2.0
+diff --git a/gradnoise_eval.py b/gradnoise_eval.py
+new file mode 100644
+index 0000000..4401382
+--- /dev/null
++++ b/gradnoise_eval.py
+@@ -0,0 +1,411 @@
++# Copyright (c) 2021, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
++#
++# NVIDIA CORPORATION and its licensors retain all intellectual property
++# and proprietary rights in and to this software, related documentation
++# and any modifications thereto.  Any use, reproduction, disclosure or
++# distribution of this software and related documentation without an express
++# license agreement from NVIDIA CORPORATION is strictly prohibited.
++
++"""Train a GAN using the techniques described in the paper
++"Alias-Free Generative Adversarial Networks"."""
++
++import os
++import click
++import re
++import json
++import tempfile
++import torch
++
++import dnnlib
++#from training import training_loop
++from training import gradnoise_training_loop as training_loop
++from metrics import metric_main
++from torch_utils import training_stats
++from torch_utils import custom_ops
++
++
++import matplotlib.pyplot as plt
++import seaborn as sns
++from pathlib import Path
++from scipy import stats
++import numpy as np
++
++sns.set()
++
++
++def fit_normal(data, ax):
++    mu, std = stats.norm.fit(data)
++    xmin, xmax = ax.get_xlim()
++    x = np.linspace(xmin, xmax, 100)
++    p = stats.norm.pdf(x, mu, std)
++    return (x, p), (mu, std)
++
++
++def plot_hists(G, D, desc, log=False):
++    fig, axs = plt.subplots(1, 2, figsize=(12, 5))
++
++    title = f"StyleGAN2 - {desc}"
++    if log:
++        title = f"{title} (log of norms)"
++
++    G = G.copy()
++    D = D.copy()
++    xlabel = r'$||g(x) - \nabla f_G(x)||_2$'
++
++    if log:
++        G = np.log(G)
++        D = np.log(D)
++        xlabel = f'$\log$({xlabel})'
++
++    ax = axs[0]
++    sns.histplot(G, ax=ax, stat="density")
++    ax.set(title='Generator Noise Norms')
++    ax.set_xlabel(xlabel)
++    
++    plot_args, (mu, std) = fit_normal(G, ax)
++    ax.plot(*plot_args, 'k', linewidth=2)
++    ax.annotate(f'$\mu$: {mu.round(2)}, $\sigma$: {std.round(2)}', xy=(0.65, 0.95), xycoords='axes fraction')
++
++    ax = axs[1]
++    sns.histplot(D, ax=ax, stat="density")
++    ax.set(title='Discriminator Noise Norms')
++    ax.set_xlabel(xlabel)
++
++    plot_args, (mu, std) = fit_normal(D, ax)
++    ax.plot(*plot_args, 'k', linewidth=2)
++    ax.annotate(f'$\mu$: {mu.round(2)}, $\sigma$: {std.round(2)}', xy=(0.65, 0.95), xycoords='axes fraction')
++    fig.suptitle(title, size=15)
++    return fig
++
++
++#----------------------------------------------------------------------------
++
++def subprocess_fn(rank, c, temp_dir, init_mp: bool = True):
++    dnnlib.util.Logger(file_name=os.path.join(c.run_dir, 'log.txt'), file_mode='a', should_flush=True)
++
++    # Init torch.distributed.
++    if c.num_gpus > 1:
++        init_file = os.path.abspath(os.path.join(temp_dir, '.torch_distributed_init'))
++        if os.name == 'nt':
++            init_method = 'file:///' + init_file.replace('\\', '/')
++            torch.distributed.init_process_group(backend='gloo', init_method=init_method, rank=rank, world_size=c.num_gpus)
++        else:
++            init_method = f'file://{init_file}'
++            torch.distributed.init_process_group(backend='nccl', init_method=init_method, rank=rank, world_size=c.num_gpus)
++
++    # Init torch_utils.
++    if init_mp:
++        sync_device = torch.device('cuda', rank) if c.num_gpus > 1 else None
++        training_stats.init_multiprocessing(rank=rank, sync_device=sync_device)
++        if rank != 0:
++            custom_ops.verbosity = 'none'
++
++    # Execute training loop.
++    training_loop.dry_training_loop(rank=rank, **c)
++
++#----------------------------------------------------------------------------
++
++def launch_training(c, desc, outdir, dry_run):
++    dnnlib.util.Logger(should_flush=True)
++
++    # Pick output directory.
++    prev_run_dirs = []
++    if os.path.isdir(outdir):
++        prev_run_dirs = [x for x in os.listdir(outdir) if os.path.isdir(os.path.join(outdir, x))]
++    prev_run_ids = [re.match(r'^\d+', x) for x in prev_run_dirs]
++    prev_run_ids = [int(x.group()) for x in prev_run_ids if x is not None]
++    cur_run_id = max(prev_run_ids, default=-1) + 1
++    c.run_dir = os.path.join(outdir, f'{cur_run_id:05d}-{desc}')
++    assert not os.path.exists(c.run_dir)
++
++    # Print options.
++    print()
++    print('Training options:')
++    print(json.dumps(c, indent=2))
++    print()
++    print(f'Output directory:    {c.run_dir}')
++    print(f'Number of GPUs:      {c.num_gpus}')
++    print(f'Batch size:          {c.batch_size} images')
++    print(f'Training duration:   {c.total_kimg} kimg')
++    print(f'Dataset path:        {c.training_set_kwargs.path}')
++    print(f'Dataset size:        {c.training_set_kwargs.max_size} images')
++    print(f'Dataset resolution:  {c.training_set_kwargs.resolution}')
++    print(f'Dataset labels:      {c.training_set_kwargs.use_labels}')
++    print(f'Dataset x-flips:     {c.training_set_kwargs.xflip}')
++    print()
++
++    # Dry run?
++    if dry_run:
++        print('Dry run; exiting.')
++        return
++
++    # Create output directory.
++    print('Creating output directory...')
++    os.makedirs(c.run_dir)
++    with open(os.path.join(c.run_dir, 'training_options.json'), 'wt') as f:
++        json.dump(c, f, indent=2)
++
++    # TODO - streamline the eval process
++    if c.mode == "both":
++        # Launch processes.
++        print('Launching processes...')
++        print()
++        print('-' * 80)
++        print()
++        print('\t\tComputing full gradients...')
++        print()
++        print('-' * 80)
++        print()
++
++        c.mode = "full"
++        torch.multiprocessing.set_start_method('spawn')
++        with tempfile.TemporaryDirectory() as temp_dir:
++            if c.num_gpus == 1:
++                subprocess_fn(rank=0, c=c, temp_dir=temp_dir)
++            else:
++                torch.multiprocessing.spawn(fn=subprocess_fn, args=(c, temp_dir), nprocs=c.num_gpus)
++
++        print()
++        print('-' * 80)
++        print()
++        print('\t\tComputing gradient norms...')
++        print()
++        print('-' * 80)
++        print()
++
++        c.mode = "stochastic"
++        c.full_grad_generator = os.path.join(c.run_dir, "generator_full_grad.pth")
++        c.full_grad_discriminator = os.path.join(c.run_dir, "discriminator_full_grad.pth")
++        with tempfile.TemporaryDirectory() as temp_dir:
++            if c.num_gpus == 1:
++                subprocess_fn(rank=0, c=c, temp_dir=temp_dir, init_mp=False)
++            else:
++                torch.multiprocessing.spawn(fn=subprocess_fn, args=(c, temp_dir, False), nprocs=c.num_gpus)
++
++        G_norm_diffs = np.load(os.path.join(c.run_dir, "generator_stoch_noise.npy"))
++        D_norm_diffs = np.load(os.path.join(c.run_dir, "discriminator_stoch_noise.npy"))
++
++        norm = plot_hists(G_norm_diffs, D_norm_diffs, desc.split("-")[-1], log=False)
++        norm.savefig(os.path.join(c.run_dir, "results_norm.png"), dpi=120)
++
++        log_norm = plot_hists(G_norm_diffs, D_norm_diffs, desc.split("-")[-1], log=True)
++        log_norm.savefig(os.path.join(c.run_dir, "results_lognorm.png"), dpi=120)
++        exit()
++
++    # Launch processes.
++    print('Launching processes...')
++    torch.multiprocessing.set_start_method('spawn')
++    with tempfile.TemporaryDirectory() as temp_dir:
++        if c.num_gpus == 1:
++            subprocess_fn(rank=0, c=c, temp_dir=temp_dir)
++        else:
++            torch.multiprocessing.spawn(fn=subprocess_fn, args=(c, temp_dir), nprocs=c.num_gpus)
++
++#----------------------------------------------------------------------------
++
++def init_dataset_kwargs(data):
++    try:
++        dataset_kwargs = dnnlib.EasyDict(class_name='training.dataset.ImageFolderDataset', path=data, use_labels=True, max_size=None, xflip=False)
++        dataset_obj = dnnlib.util.construct_class_by_name(**dataset_kwargs) # Subclass of training.dataset.Dataset.
++        dataset_kwargs.resolution = dataset_obj.resolution # Be explicit about resolution.
++        dataset_kwargs.use_labels = dataset_obj.has_labels # Be explicit about labels.
++        dataset_kwargs.max_size = len(dataset_obj) # Be explicit about dataset size.
++        return dataset_kwargs, dataset_obj.name
++    except IOError as err:
++        raise click.ClickException(f'--data: {err}')
++
++#----------------------------------------------------------------------------
++
++def parse_comma_separated_list(s):
++    if isinstance(s, list):
++        return s
++    if s is None or s.lower() == 'none' or s == '':
++        return []
++    return s.split(',')
++
++#----------------------------------------------------------------------------
++
++@click.command()
++
++# Required.
++@click.option('--outdir',       help='Where to save the results', metavar='DIR',                required=True)
++@click.option('--cfg',          help='Base configuration',                                      type=click.Choice(['stylegan3-t', 'stylegan3-r', 'stylegan2']), required=True)
++@click.option('--data',         help='Training data', metavar='[ZIP|DIR]',                      type=str, required=True)
++@click.option('--gpus',         help='Number of GPUs to use', metavar='INT',                    type=click.IntRange(min=1), required=True)
++@click.option('--batch',        help='Total batch size', metavar='INT',                         type=click.IntRange(min=1), required=True)
++@click.option('--gamma',        help='R1 regularization weight', metavar='FLOAT',               type=click.FloatRange(min=0), required=True)
++
++# Optional features.
++@click.option('--cond',         help='Train conditional model', metavar='BOOL',                 type=bool, default=False, show_default=True)
++@click.option('--mirror',       help='Enable dataset x-flips', metavar='BOOL',                  type=bool, default=False, show_default=True)
++@click.option('--aug',          help='Augmentation mode',                                       type=click.Choice(['noaug', 'ada', 'fixed']), default='ada', show_default=True)
++@click.option('--resume',       help='Resume from given network pickle', metavar='[PATH|URL]',  type=str)
++@click.option('--freezed',      help='Freeze first layers of D', metavar='INT',                 type=click.IntRange(min=0), default=0, show_default=True)
++
++# Misc hyperparameters.
++@click.option('--p',            help='Probability for --aug=fixed', metavar='FLOAT',            type=click.FloatRange(min=0, max=1), default=0.2, show_default=True)
++@click.option('--target',       help='Target value for --aug=ada', metavar='FLOAT',             type=click.FloatRange(min=0, max=1), default=0.6, show_default=True)
++@click.option('--batch-gpu',    help='Limit batch size per GPU', metavar='INT',                 type=click.IntRange(min=1))
++@click.option('--cbase',        help='Capacity multiplier', metavar='INT',                      type=click.IntRange(min=1), default=32768, show_default=True)
++@click.option('--cmax',         help='Max. feature maps', metavar='INT',                        type=click.IntRange(min=1), default=512, show_default=True)
++@click.option('--glr',          help='G learning rate  [default: varies]', metavar='FLOAT',     type=click.FloatRange(min=0))
++@click.option('--dlr',          help='D learning rate', metavar='FLOAT',                        type=click.FloatRange(min=0), default=0.002, show_default=True)
++@click.option('--map-depth',    help='Mapping network depth  [default: varies]', metavar='INT', type=click.IntRange(min=1))
++@click.option('--mbstd-group',  help='Minibatch std group size', metavar='INT',                 type=click.IntRange(min=1), default=4, show_default=True)
++
++# Misc settings.
++@click.option('--desc',         help='String to include in result dir name', metavar='STR',     type=str)
++@click.option('--metrics',      help='Quality metrics', metavar='[NAME|A,B,C|none]',            type=parse_comma_separated_list, default='fid50k_full', show_default=True)
++@click.option('--kimg',         help='Total training duration', metavar='KIMG',                 type=click.IntRange(min=1), default=25000, show_default=True)
++@click.option('--tick',         help='How often to print progress', metavar='KIMG',             type=click.IntRange(min=1), default=4, show_default=True)
++@click.option('--snap',         help='How often to save snapshots', metavar='TICKS',            type=click.IntRange(min=1), default=50, show_default=True)
++@click.option('--seed',         help='Random seed', metavar='INT',                              type=click.IntRange(min=0), default=0, show_default=True)
++@click.option('--fp32',         help='Disable mixed-precision', metavar='BOOL',                 type=bool, default=False, show_default=True)
++@click.option('--nobench',      help='Disable cuDNN benchmarking', metavar='BOOL',              type=bool, default=False, show_default=True)
++@click.option('--workers',      help='DataLoader worker processes', metavar='INT',              type=click.IntRange(min=1), default=3, show_default=True)
++@click.option('-n','--dry-run', help='Print training options and exit',                         is_flag=True)
++@click.option('-t','--tag',      help='Optionally append a tag to the run_dir', metavar='STR',   type=str, default=None)
++
++# Grad noise computations
++@click.option('--mode',         help='Either "both", "full", or "stochastic"', metavar='STR',   type=click.Choice(['full', 'stochastic', 'both']), default="full", show_default=True)
++@click.option('--full_grad_gen',  help='Save path for grad noise stuff', metavar='STR',         type=str, default=None, show_default=True)
++@click.option('--full_grad_disc', help='Save path for grad noise stuff', metavar='STR',         type=str, default=None, show_default=True)
++
++def main(**kwargs):
++    """Train a GAN using the techniques described in the paper
++    "Alias-Free Generative Adversarial Networks".
++
++    Examples:
++
++    \b
++    # Train StyleGAN3-T for AFHQv2 using 8 GPUs.
++    python train.py --outdir=~/training-runs --cfg=stylegan3-t --data=~/datasets/afhqv2-512x512.zip \\
++        --gpus=8 --batch=32 --gamma=8.2 --mirror=1
++
++    \b
++    # Fine-tune StyleGAN3-R for MetFaces-U using 1 GPU, starting from the pre-trained FFHQ-U pickle.
++    python train.py --outdir=~/training-runs --cfg=stylegan3-r --data=~/datasets/metfacesu-1024x1024.zip \\
++        --gpus=8 --batch=32 --gamma=6.6 --mirror=1 --kimg=5000 --snap=5 \\
++        --resume=https://api.ngc.nvidia.com/v2/models/nvidia/research/stylegan3/versions/1/files/stylegan3-r-ffhqu-1024x1024.pkl
++
++    \b
++    # Train StyleGAN2 for FFHQ at 1024x1024 resolution using 8 GPUs.
++    python train.py --outdir=~/training-runs --cfg=stylegan2 --data=~/datasets/ffhq-1024x1024.zip \\
++        --gpus=8 --batch=32 --gamma=10 --mirror=1 --aug=noaug
++    """
++
++    # Initialize config.
++    opts = dnnlib.EasyDict(kwargs) # Command line arguments.
++    c = dnnlib.EasyDict() # Main config dict.
++    c.G_kwargs = dnnlib.EasyDict(class_name=None, z_dim=512, w_dim=512, mapping_kwargs=dnnlib.EasyDict())
++    c.D_kwargs = dnnlib.EasyDict(class_name='training.networks_stylegan2.Discriminator', block_kwargs=dnnlib.EasyDict(), mapping_kwargs=dnnlib.EasyDict(), epilogue_kwargs=dnnlib.EasyDict())
++    # will likely need to retrain a StyleGAN2 model on CIFAR with Extragradient methods
++    c.G_opt_kwargs = dnnlib.EasyDict(class_name='torch.optim.Adam', betas=[0,0.99], eps=1e-8)
++    c.D_opt_kwargs = dnnlib.EasyDict(class_name='torch.optim.Adam', betas=[0,0.99], eps=1e-8)
++
++    # c.loss_kwargs = dnnlib.EasyDict(class_name='training.loss.StyleGAN2Loss')  
++    c.loss_kwargs = dnnlib.EasyDict(class_name='training.gradnoise_loss.StyleGAN2Loss')  
++
++    c.data_loader_kwargs = dnnlib.EasyDict(pin_memory=True, prefetch_factor=2)
++
++    # Training set.
++    c.training_set_kwargs, dataset_name = init_dataset_kwargs(data=opts.data)
++    if opts.cond and not c.training_set_kwargs.use_labels:
++        raise click.ClickException('--cond=True requires labels specified in dataset.json')
++    c.training_set_kwargs.use_labels = opts.cond
++    c.training_set_kwargs.xflip = opts.mirror
++
++    # Hyperparameters & settings.
++    c.num_gpus = opts.gpus
++    c.batch_size = opts.batch
++    c.batch_gpu = opts.batch_gpu or opts.batch // opts.gpus
++    c.G_kwargs.channel_base = c.D_kwargs.channel_base = opts.cbase
++    c.G_kwargs.channel_max = c.D_kwargs.channel_max = opts.cmax
++    c.G_kwargs.mapping_kwargs.num_layers = (8 if opts.cfg == 'stylegan2' else 2) if opts.map_depth is None else opts.map_depth
++    c.D_kwargs.block_kwargs.freeze_layers = opts.freezed
++    c.D_kwargs.epilogue_kwargs.mbstd_group_size = opts.mbstd_group
++    c.loss_kwargs.r1_gamma = opts.gamma
++    c.G_opt_kwargs.lr = (0.002 if opts.cfg == 'stylegan2' else 0.0025) if opts.glr is None else opts.glr
++    c.D_opt_kwargs.lr = opts.dlr
++    c.metrics = opts.metrics
++    c.total_kimg = opts.kimg
++    c.kimg_per_tick = opts.tick
++    c.image_snapshot_ticks = c.network_snapshot_ticks = opts.snap
++    c.random_seed = c.training_set_kwargs.random_seed = opts.seed
++    c.data_loader_kwargs.num_workers = opts.workers
++
++    # Sanity checks.
++    if c.batch_size % c.num_gpus != 0:
++        raise click.ClickException('--batch must be a multiple of --gpus')
++    if c.batch_size % (c.num_gpus * c.batch_gpu) != 0:
++        raise click.ClickException('--batch must be a multiple of --gpus times --batch-gpu')
++    if c.batch_gpu < c.D_kwargs.epilogue_kwargs.mbstd_group_size:
++        raise click.ClickException('--batch-gpu cannot be smaller than --mbstd')
++    if any(not metric_main.is_valid_metric(metric) for metric in c.metrics):
++        raise click.ClickException('\n'.join(['--metrics can only contain the following values:'] + metric_main.list_valid_metrics()))
++
++    # Base configuration.
++    c.ema_kimg = c.batch_size * 10 / 32
++    if opts.cfg == 'stylegan2':
++        c.G_kwargs.class_name = 'training.networks_stylegan2.Generator'
++        c.loss_kwargs.style_mixing_prob = 0.9 # Enable style mixing regularization.
++        c.loss_kwargs.pl_weight = 2 # Enable path length regularization.
++        c.G_reg_interval = 4 # Enable lazy regularization for G.
++        c.G_kwargs.fused_modconv_default = 'inference_only' # Speed up training by using regular convolutions instead of grouped convolutions.
++        c.loss_kwargs.pl_no_weight_grad = True # Speed up path length regularization by skipping gradient computation wrt. conv2d weights.
++    else:
++        c.G_kwargs.class_name = 'training.networks_stylegan3.Generator'
++        c.G_kwargs.magnitude_ema_beta = 0.5 ** (c.batch_size / (20 * 1e3))
++        if opts.cfg == 'stylegan3-r':
++            c.G_kwargs.conv_kernel = 1 # Use 1x1 convolutions.
++            c.G_kwargs.channel_base *= 2 # Double the number of feature maps.
++            c.G_kwargs.channel_max *= 2
++            c.G_kwargs.use_radial_filters = True # Use radially symmetric downsampling filters.
++            c.loss_kwargs.blur_init_sigma = 10 # Blur the images seen by the discriminator.
++            c.loss_kwargs.blur_fade_kimg = c.batch_size * 200 / 32 # Fade out the blur during the first N kimg.
++
++    # Augmentation.
++    if opts.aug != 'noaug':
++        c.augment_kwargs = dnnlib.EasyDict(class_name='training.augment.AugmentPipe', xflip=1, rotate90=1, xint=1, scale=1, rotate=1, aniso=1, xfrac=1, brightness=1, contrast=1, lumaflip=1, hue=1, saturation=1)
++        if opts.aug == 'ada':
++            c.ada_target = opts.target
++        if opts.aug == 'fixed':
++            c.augment_p = opts.p
++
++    # Resume.
++    if opts.resume is not None:
++        c.resume_pkl = opts.resume
++        c.ada_kimg = 100 # Make ADA react faster at the beginning.
++        c.ema_rampup = None # Disable EMA rampup.
++        c.loss_kwargs.blur_init_sigma = 0 # Disable blur rampup.
++
++    # Performance-related toggles.
++    if opts.fp32:
++        c.G_kwargs.num_fp16_res = c.D_kwargs.num_fp16_res = 0
++        c.G_kwargs.conv_clamp = c.D_kwargs.conv_clamp = None
++    if opts.nobench:
++        c.cudnn_benchmark = False
++
++    # Description string.
++    desc = f'{opts.cfg:s}-{dataset_name:s}-gpus{c.num_gpus:d}-batch{c.batch_size:d}-gamma{c.loss_kwargs.r1_gamma:g}'
++    if opts.desc is not None:
++        desc += f'-{opts.desc}'
++
++
++    # full gradient stuff
++    c.mode = opts.mode
++    # c.save_path = opts.save_path
++
++    if opts.mode == "stochastic":
++        c.full_grad_generator = opts.full_grad_gen
++        c.full_grad_discriminator = opts.full_grad_disc
++
++    # Launch.
++    launch_training(c=c, desc=desc, outdir=opts.outdir, dry_run=opts.dry_run)
++
++#----------------------------------------------------------------------------
++
++if __name__ == "__main__":
++    main() # pylint: disable=no-value-for-parameter
++
++#----------------------------------------------------------------------------
+diff --git a/train.py b/train.py
+index be883c9..e662e8e 100644
+--- a/train.py
++++ b/train.py
+@@ -22,6 +22,20 @@ from metrics import metric_main
+ from torch_utils import training_stats
+ from torch_utils import custom_ops
+ 
++OPTIMIZERS = dnnlib.EasyDict(
++    adam=dnnlib.EasyDict(name='torch.optim.Adam', params=dict(betas=[0,0.99], eps=1e-8)),
++    sgd=dnnlib.EasyDict(name='torch.optim.SGD', params=dict(momentum=0, dampening=0, weight_decay=0)),
++    norm_sgd=dnnlib.EasyDict(name='training.optim.NormalizedSGD', params=dict(momentum=0, dampening=0, weight_decay=0)),
++    extra_adam=dnnlib.EasyDict(name='training.optim.ExtraAdam', params=dict(betas=[0,0.99], eps=1e-8)),
++    optimistic_adam=dnnlib.EasyDict(name='training.optim.OptimisticAdam', params=dict(betas=[0,0.99], eps=1e-8)),
++    extra_sgd=dnnlib.EasyDict(name='training.optim.ExtraSGD', params=dict(momentum=0, dampening=0, weight_decay=0)),
++    # acclip
++    acclip=dnnlib.EasyDict(name='training.optim.DefaultACClip', params=dict(betas=[0.9,0.99], eps=1e-5, alpha=2, mod=1, weight_decay=1e-5)),
++    paper_acclip=dnnlib.EasyDict(name='training.optim.DefaultACClip', params=dict(betas=[0.9,0.99], eps=1e-5, alpha=1, mod=0, weight_decay=1e-5)),
++    nomom_acclip=dnnlib.EasyDict(name='training.optim.DefaultACClip', params=dict(betas=[0.0,0.99], eps=1e-5, alpha=1, mod=0, weight_decay=1e-5)),
++    nomom_paper_acclip=dnnlib.EasyDict(name='training.optim.DefaultACClip', params=dict(betas=[0.0,0.99], eps=1e-5, alpha=1, mod=0, weight_decay=1e-5)),
++)
++
+ #----------------------------------------------------------------------------
+ 
+ def subprocess_fn(rank, c, temp_dir):
+@@ -137,6 +151,10 @@ def parse_comma_separated_list(s):
+ @click.option('--aug',          help='Augmentation mode',                                       type=click.Choice(['noaug', 'ada', 'fixed']), default='ada', show_default=True)
+ @click.option('--resume',       help='Resume from given network pickle', metavar='[PATH|URL]',  type=str)
+ @click.option('--freezed',      help='Freeze first layers of D', metavar='INT',                 type=click.IntRange(min=0), default=0, show_default=True)
++@click.option('--optimizer',    help='Select which optimizer to use', metavar='STR',            type=click.Choice(OPTIMIZERS.keys()), default='adam', show_default=True)
++
++@click.option('--gregint',    help='Generator regularization interval (0=both, default=auto)', metavar='INT',     type=click.IntRange(min=0), default=None, show_default=True)
++@click.option('--dregint',    help='Discriminator regularization interval (0=both, default=auto)', metavar='INT', type=click.IntRange(min=0), default=None, show_default=True)
+ 
+ # Misc hyperparameters.
+ @click.option('--p',            help='Probability for --aug=fixed', metavar='FLOAT',            type=click.FloatRange(min=0, max=1), default=0.2, show_default=True)
+@@ -149,6 +167,11 @@ def parse_comma_separated_list(s):
+ @click.option('--map-depth',    help='Mapping network depth  [default: varies]', metavar='INT', type=click.IntRange(min=1))
+ @click.option('--mbstd-group',  help='Minibatch std group size', metavar='INT',                 type=click.IntRange(min=1), default=4, show_default=True)
+ 
++@click.option('--clip-mode',    help='Specify clip mode (norm, value)', metavar='STR',          type=click.Choice([None, 'norm', 'value']), default=None, show_default=True)
++@click.option('--clip-norm-type', help='Specify clip norm type (check torch)', metavar='STR',   type=str, default=2, show_default=True)
++@click.option('--clip-gmax',    help='Max generator grad value', metavar='FLOAT',               type=click.FloatRange(min=0), default=None, show_default=True)
++@click.option('--clip-dmax',    help='Max discriminator grad value', metavar='FLOAT',           type=click.FloatRange(min=0), default=None, show_default=True)
++
+ # Misc settings.
+ @click.option('--desc',         help='String to include in result dir name', metavar='STR',     type=str)
+ @click.option('--metrics',      help='Quality metrics', metavar='[NAME|A,B,C|none]',            type=parse_comma_separated_list, default='fid50k_full', show_default=True)
+@@ -160,6 +183,8 @@ def parse_comma_separated_list(s):
+ @click.option('--nobench',      help='Disable cuDNN benchmarking', metavar='BOOL',              type=bool, default=False, show_default=True)
+ @click.option('--workers',      help='DataLoader worker processes', metavar='INT',              type=click.IntRange(min=1), default=3, show_default=True)
+ @click.option('-n','--dry-run', help='Print training options and exit',                         is_flag=True)
++@click.option('--log-grad',     help='Log gradient histograms', metavar='STR',                  is_flag=True)
++@click.option('--log-update-norm', help='Log norm of updates', metavar='STR',                   is_flag=True)
+ 
+ def main(**kwargs):
+     """Train a GAN using the techniques described in the paper
+@@ -189,8 +214,11 @@ def main(**kwargs):
+     c = dnnlib.EasyDict() # Main config dict.
+     c.G_kwargs = dnnlib.EasyDict(class_name=None, z_dim=512, w_dim=512, mapping_kwargs=dnnlib.EasyDict())
+     c.D_kwargs = dnnlib.EasyDict(class_name='training.networks_stylegan2.Discriminator', block_kwargs=dnnlib.EasyDict(), mapping_kwargs=dnnlib.EasyDict(), epilogue_kwargs=dnnlib.EasyDict())
+-    c.G_opt_kwargs = dnnlib.EasyDict(class_name='torch.optim.Adam', betas=[0,0.99], eps=1e-8)
+-    c.D_opt_kwargs = dnnlib.EasyDict(class_name='torch.optim.Adam', betas=[0,0.99], eps=1e-8)
++
++    o = opts.optimizer
++    c.G_opt_kwargs = dnnlib.EasyDict(class_name=OPTIMIZERS[o].name, **OPTIMIZERS[o].params)
++    c.D_opt_kwargs = dnnlib.EasyDict(class_name=OPTIMIZERS[o].name, **OPTIMIZERS[o].params)
++
+     c.loss_kwargs = dnnlib.EasyDict(class_name='training.loss.StyleGAN2Loss')
+     c.data_loader_kwargs = dnnlib.EasyDict(pin_memory=True, prefetch_factor=2)
+ 
+@@ -271,9 +299,37 @@ def main(**kwargs):
+         c.G_kwargs.conv_clamp = c.D_kwargs.conv_clamp = None
+     if opts.nobench:
+         c.cudnn_benchmark = False
++    
++    # TODO custom stuff
++    c.log_grad_hist = opts.log_grad
++    c.log_update_norm = opts.log_update_norm
++
++    if opts.clip_mode == "norm":
++        _clip_desc = f"-norm-g{opts.clip_gmax}-d{opts.clip_dmax}"
++        G_clip_kwargs = dnnlib.EasyDict(mode=opts.clip_mode, max_norm=opts.clip_gmax, norm_type=opts.clip_norm_type)
++        D_clip_kwargs = dnnlib.EasyDict(mode=opts.clip_mode, max_norm=opts.clip_dmax, norm_type=opts.clip_norm_type)
++    elif opts.clip_mode == "value":
++        _clip_desc = f"-val-g{opts.clip_gmax}-d{opts.clip_dmax}"
++        G_clip_kwargs = dnnlib.EasyDict(mode=opts.clip_mode, clip_value=opts.clip_gmax)
++        D_clip_kwargs = dnnlib.EasyDict(mode=opts.clip_mode, clip_value=opts.clip_dmax)
++    else:
++        _clip_desc = ""
++        G_clip_kwargs = {}
++        D_clip_kwargs = {}
++
++    c.G_clip_kwargs = G_clip_kwargs
++    c.D_clip_kwargs = D_clip_kwargs
++
++    # if None (default), leave as auto config; if 0, disable reg interval; else set as user specified int
++    if opts.gregint is not None:
++        c.G_reg_interval = None if opts.gregint == 0 else opts.gregint
++    if opts.dregint is not None:
++        c.D_reg_interval = None if opts.dregint == 0 else opts.dregint
+ 
+     # Description string.
+-    desc = f'{opts.cfg:s}-{dataset_name:s}-gpus{c.num_gpus:d}-batch{c.batch_size:d}-gamma{c.loss_kwargs.r1_gamma:g}'
++    # desc = f'{opts.cfg:s}-{dataset_name:s}-gpus{c.num_gpus:d}-batch{c.batch_size:d}-gamma{c.loss_kwargs.r1_gamma:g}'
++    desc = f'{opts.cfg:s}-gamma{c.loss_kwargs.r1_gamma:g}'
++    desc = f'{desc}-{opts.optimizer}{_clip_desc}-dlr{opts.dlr}-glr{opts.glr}'
+     if opts.desc is not None:
+         desc += f'-{opts.desc}'
+ 
+diff --git a/training/gradnoise_loss.py b/training/gradnoise_loss.py
+new file mode 100644
+index 0000000..3c7ba34
+--- /dev/null
++++ b/training/gradnoise_loss.py
+@@ -0,0 +1,270 @@
++# Copyright (c) 2021, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
++#
++# NVIDIA CORPORATION and its licensors retain all intellectual property
++# and proprietary rights in and to this software, related documentation
++# and any modifications thereto.  Any use, reproduction, disclosure or
++# distribution of this software and related documentation without an express
++# license agreement from NVIDIA CORPORATION is strictly prohibited.
++
++"""Loss functions."""
++
++from queue import Full
++import numpy as np
++import os
++import torch
++from torch_utils import training_stats
++from torch_utils.ops import conv2d_gradfix
++from torch_utils.ops import upfirdn2d
++
++# ----------------------------------------------------------------------------
++
++
++class Loss:
++    def accumulate_gradients(
++        self, phase, real_img, real_c, gen_z, gen_c, gain, cur_nimg
++    ):  # to be overridden by subclass
++        raise NotImplementedError()
++
++
++# ----------------------------------------------------------------------------
++
++
++def get_batch_grad(model: torch.nn.Module) -> torch.Tensor:
++    """Returns a flattened 1d array of all the parameter gradients"""
++    gr = []
++    try:
++        for i in model.parameters():
++            if i.requires_grad:
++                gr.append(i.grad.detach().reshape(-1))
++        return torch.cat(gr)
++
++    except AttributeError as e:
++        print("Caught exception - returning None")
++        print(e)
++        return None
++
++
++class FullBatchGrad:
++    def __init__(self):
++        self.grads = None
++        self.t = 0
++    
++    # prefer this implementation over the running avg due to numerical errors
++    # also note that you don't need to specify the batch size in the case where all batch sizes
++    # are the same
++    def accumulate(self, model: torch.nn.Module, batch_size: int = 1):
++        g = get_batch_grad(model)
++        if g is None:
++            print("warning: missing grads...?")
++            return 
++
++        if self.grads is None:
++            self.grads = g * batch_size
++        else:
++            self.grads += g * batch_size
++        self.t += 1 
++    
++    def get_average(self, batch_size: int = 1) -> torch.Tensor:
++        if self.t == 0: 
++            return None
++        return self.grads / (self.t * batch_size)
++
++    def reset(self):
++        self.grads = None
++        self.t = 0
++
++    def save(self, path: str, batch_size: int = 1):
++        torch.save(self.get_average(batch_size), path)
++
++# class Mean:
++#     def __init__(self):
++#         self.t = 0
++#         self.avg = 0
++#     def __call__(self, x):
++#         self.t += 1
++#         self.avg += (x - self.avg)/(self.t)
++#     def reset(self):
++#         self.t = 0
++#         self.avg = 0
++#     @property
++#     def val(self):
++#         return self.avg
++
++
++# ----------------------------------------------------------------------------
++
++
++class StyleGAN2Loss(Loss):
++    def __init__(
++        self,
++        device,
++        G,
++        D,
++        augment_pipe=None,
++        r1_gamma=10,
++        style_mixing_prob=0,
++        pl_weight=0,
++        pl_batch_shrink=2,
++        pl_decay=0.01,
++        pl_no_weight_grad=False,
++        blur_init_sigma=0,
++        blur_fade_kimg=0,
++        accumulate_full_gradient: bool = False,
++    ):
++        super().__init__()
++        self.device = device
++        self.G = G
++        self.D = D
++        self.augment_pipe = augment_pipe
++        self.r1_gamma = r1_gamma
++        self.style_mixing_prob = style_mixing_prob
++        self.pl_weight = pl_weight
++        self.pl_batch_shrink = pl_batch_shrink
++        self.pl_decay = pl_decay
++        self.pl_no_weight_grad = pl_no_weight_grad
++        self.pl_mean = torch.zeros([], device=device)
++        self.blur_init_sigma = blur_init_sigma
++        self.blur_fade_kimg = blur_fade_kimg
++
++        self.accumulate_full_gradient = accumulate_full_gradient
++        self.full_grad_G = FullBatchGrad()
++        self.full_grad_D = FullBatchGrad()
++
++    def run_G(self, z, c, update_emas=False):
++        ws = self.G.mapping(z, c, update_emas=update_emas)
++        if self.style_mixing_prob > 0:
++            with torch.autograd.profiler.record_function("style_mixing"):
++                cutoff = torch.empty([], dtype=torch.int64, device=ws.device).random_(1, ws.shape[1])
++                cutoff = torch.where(
++                    torch.rand([], device=ws.device) < self.style_mixing_prob,
++                    cutoff,
++                    torch.full_like(cutoff, ws.shape[1]),
++                )
++                ws[:, cutoff:] = self.G.mapping(torch.randn_like(z), c, update_emas=False)[:, cutoff:]
++        img = self.G.synthesis(ws, update_emas=update_emas)
++        return img, ws
++
++    def run_D(self, img, c, blur_sigma=0, update_emas=False):
++        blur_size = np.floor(blur_sigma * 3)
++        if blur_size > 0:
++            with torch.autograd.profiler.record_function("blur"):
++                f = torch.arange(-blur_size, blur_size + 1, device=img.device).div(blur_sigma).square().neg().exp2()
++                img = upfirdn2d.filter2d(img, f / f.sum())
++        if self.augment_pipe is not None:
++            img = self.augment_pipe(img)
++        logits = self.D(img, c, update_emas=update_emas)
++        return logits
++
++
++    def accumulate_gradients(self, phase, real_img, real_c, gen_z, gen_c, gain, cur_nimg):
++        assert phase in ["Gmain", "Greg", "Gboth", "Dmain", "Dreg", "Dboth"]
++        if self.pl_weight == 0:
++            phase = {"Greg": "none", "Gboth": "Gmain"}.get(phase, phase)
++        if self.r1_gamma == 0:
++            phase = {"Dreg": "none", "Dboth": "Dmain"}.get(phase, phase)
++        blur_sigma = (
++            max(1 - cur_nimg / (self.blur_fade_kimg * 1e3), 0) * self.blur_init_sigma if self.blur_fade_kimg > 0 else 0
++        )
++
++        # Gmain: Maximize logits for generated images.
++        if phase in ["Gmain", "Gboth"]:
++
++            with torch.autograd.profiler.record_function("Gmain_forward"):
++                gen_img, _gen_ws = self.run_G(gen_z, gen_c)
++                gen_logits = self.run_D(gen_img, gen_c, blur_sigma=blur_sigma)
++                training_stats.report("Loss/scores/fake", gen_logits)
++                training_stats.report("Loss/signs/fake", gen_logits.sign())
++                loss_Gmain = torch.nn.functional.softplus(-gen_logits)  # -log(sigmoid(gen_logits))
++                training_stats.report("Loss/G/loss", loss_Gmain)
++
++            with torch.autograd.profiler.record_function("Gmain_backward"):
++                loss_Gmain.mean().mul(gain).backward()
++
++        # Gpl: Apply path length regularization.
++        if phase in ["Greg", "Gboth"]:
++            with torch.autograd.profiler.record_function("Gpl_forward"):
++                batch_size = gen_z.shape[0] // self.pl_batch_shrink
++                gen_img, gen_ws = self.run_G(gen_z[:batch_size], gen_c[:batch_size])
++                pl_noise = torch.randn_like(gen_img) / np.sqrt(gen_img.shape[2] * gen_img.shape[3])
++                with torch.autograd.profiler.record_function("pl_grads"), conv2d_gradfix.no_weight_gradients(
++                    self.pl_no_weight_grad
++                ):
++                    pl_grads = torch.autograd.grad(
++                        outputs=[(gen_img * pl_noise).sum()], inputs=[gen_ws], create_graph=True, only_inputs=True
++                    )[0]
++                pl_lengths = pl_grads.square().sum(2).mean(1).sqrt()
++                pl_mean = self.pl_mean.lerp(pl_lengths.mean(), self.pl_decay)
++                self.pl_mean.copy_(pl_mean.detach())
++                pl_penalty = (pl_lengths - pl_mean).square()
++                training_stats.report("Loss/pl_penalty", pl_penalty)
++                loss_Gpl = pl_penalty * self.pl_weight
++                training_stats.report("Loss/G/reg", loss_Gpl)
++            with torch.autograd.profiler.record_function("Gpl_backward"):
++                loss_Gpl.mean().mul(gain).backward()
++
++        # Dmain: Minimize logits for generated images.
++        loss_Dgen = 0
++        if phase in ["Dmain", "Dboth"]:
++            with torch.autograd.profiler.record_function("Dgen_forward"):
++                gen_img, _gen_ws = self.run_G(gen_z, gen_c, update_emas=True)
++                gen_logits = self.run_D(gen_img, gen_c, blur_sigma=blur_sigma, update_emas=True)
++                training_stats.report("Loss/scores/fake", gen_logits)
++                training_stats.report("Loss/signs/fake", gen_logits.sign())
++                loss_Dgen = torch.nn.functional.softplus(gen_logits)  # -log(1 - sigmoid(gen_logits))
++            with torch.autograd.profiler.record_function("Dgen_backward"):
++                loss_Dgen.mean().mul(gain).backward()
++
++        # Dmain: Maximize logits for real images.
++        # Dr1: Apply R1 regularization.
++        if phase in ["Dmain", "Dreg", "Dboth"]:
++            name = "Dreal" if phase == "Dmain" else "Dr1" if phase == "Dreg" else "Dreal_Dr1"
++            with torch.autograd.profiler.record_function(name + "_forward"):
++                real_img_tmp = real_img.detach().requires_grad_(phase in ["Dreg", "Dboth"])
++                real_logits = self.run_D(real_img_tmp, real_c, blur_sigma=blur_sigma)
++                training_stats.report("Loss/scores/real", real_logits)
++                training_stats.report("Loss/signs/real", real_logits.sign())
++
++                loss_Dreal = 0
++                if phase in ["Dmain", "Dboth"]:
++                    loss_Dreal = torch.nn.functional.softplus(-real_logits)  # -log(sigmoid(real_logits))
++                    training_stats.report("Loss/D/loss", loss_Dgen + loss_Dreal)
++
++                loss_Dr1 = 0
++                if phase in ["Dreg", "Dboth"]:
++                    with torch.autograd.profiler.record_function("r1_grads"), conv2d_gradfix.no_weight_gradients():
++                        r1_grads = torch.autograd.grad(
++                            outputs=[real_logits.sum()], inputs=[real_img_tmp], create_graph=True, only_inputs=True
++                        )[0]
++                    r1_penalty = r1_grads.square().sum([1, 2, 3])
++                    loss_Dr1 = r1_penalty * (self.r1_gamma / 2)
++                    training_stats.report("Loss/r1_penalty", r1_penalty)
++                    training_stats.report("Loss/D/reg", loss_Dr1)
++
++            with torch.autograd.profiler.record_function(name + "_backward"):
++                (loss_Dreal + loss_Dr1).mean().mul(gain).backward()
++
++        if self.accumulate_full_gradient:
++            # accumulate generator full gradient
++            if phase in ["Gmain", "Greg", "Gboth"]:
++                self.full_grad_G.accumulate(self.G)
++
++            # accumulate discriminator full gradient
++            if phase in ["Dmain", "Dreg", "Dboth"]:
++                self.full_grad_D.accumulate(self.D)
++
++    def clear_full_grad(self):
++        self.full_grad_G.reset()
++        self.full_grad_D.reset()
++    
++    def get_full_grad_G(self) -> torch.Tensor:
++        return self.full_grad_G.get_average()
++
++    def get_full_grad_D(self) -> torch.Tensor:
++        return self.full_grad_D.get_average()
++
++    def save(self, path: str, batch_size: int = 1):
++        self.full_grad_G.save(os.path.join(path, "generator_full_grad.pth"), batch_size)
++        self.full_grad_D.save(os.path.join(path, "discriminator_full_grad.pth"), batch_size)
++
++
++# ----------------------------------------------------------------------------
+diff --git a/training/gradnoise_training_loop.py b/training/gradnoise_training_loop.py
+new file mode 100644
+index 0000000..031a636
+--- /dev/null
++++ b/training/gradnoise_training_loop.py
+@@ -0,0 +1,518 @@
++# Copyright (c) 2021, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
++#
++# NVIDIA CORPORATION and its licensors retain all intellectual property
++# and proprietary rights in and to this software, related documentation
++# and any modifications thereto.  Any use, reproduction, disclosure or
++# distribution of this software and related documentation without an express
++# license agreement from NVIDIA CORPORATION is strictly prohibited.
++
++"""Main training loop."""
++
++from operator import mod
++import os
++import time
++import copy
++import json
++import pickle
++import psutil
++import PIL.Image
++import numpy as np
++import torch
++import dnnlib
++from torch_utils import misc
++from torch_utils import training_stats
++from torch_utils.ops import conv2d_gradfix
++from torch_utils.ops import grid_sample_gradfix
++
++import legacy
++from metrics import metric_main
++
++#----------------------------------------------------------------------------
++
++def setup_snapshot_image_grid(training_set, random_seed=0):
++    rnd = np.random.RandomState(random_seed)
++    gw = np.clip(7680 // training_set.image_shape[2], 7, 32)
++    gh = np.clip(4320 // training_set.image_shape[1], 4, 32)
++
++    # No labels => show random subset of training samples.
++    if not training_set.has_labels:
++        all_indices = list(range(len(training_set)))
++        rnd.shuffle(all_indices)
++        grid_indices = [all_indices[i % len(all_indices)] for i in range(gw * gh)]
++
++    else:
++        # Group training samples by label.
++        label_groups = dict() # label => [idx, ...]
++        for idx in range(len(training_set)):
++            label = tuple(training_set.get_details(idx).raw_label.flat[::-1])
++            if label not in label_groups:
++                label_groups[label] = []
++            label_groups[label].append(idx)
++
++        # Reorder.
++        label_order = sorted(label_groups.keys())
++        for label in label_order:
++            rnd.shuffle(label_groups[label])
++
++        # Organize into grid.
++        grid_indices = []
++        for y in range(gh):
++            label = label_order[y % len(label_order)]
++            indices = label_groups[label]
++            grid_indices += [indices[x % len(indices)] for x in range(gw)]
++            label_groups[label] = [indices[(i + gw) % len(indices)] for i in range(len(indices))]
++
++    # Load data.
++    images, labels = zip(*[training_set[i] for i in grid_indices])
++    return (gw, gh), np.stack(images), np.stack(labels)
++
++#----------------------------------------------------------------------------
++
++def save_image_grid(img, fname, drange, grid_size):
++    lo, hi = drange
++    img = np.asarray(img, dtype=np.float32)
++    img = (img - lo) * (255 / (hi - lo))
++    img = np.rint(img).clip(0, 255).astype(np.uint8)
++
++    gw, gh = grid_size
++    _N, C, H, W = img.shape
++    img = img.reshape([gh, gw, C, H, W])
++    img = img.transpose(0, 3, 1, 4, 2)
++    img = img.reshape([gh * H, gw * W, C])
++
++    assert C in [1, 3]
++    if C == 1:
++        PIL.Image.fromarray(img[:, :, 0], 'L').save(fname)
++    if C == 3:
++        PIL.Image.fromarray(img, 'RGB').save(fname)
++
++#----------------------------------------------------------------------------
++
++
++def get_batch_grad(model: torch.nn.Module) -> torch.Tensor:
++    """Returns a flattened 1d array of all the parameter gradients"""
++    gr = []
++    try:
++        for i in model.parameters():
++            if i.requires_grad:
++                gr.append(i.grad.detach().reshape(-1))
++        return torch.cat(gr)
++    except AttributeError as e:
++        print("Caught exception - returning None")
++        print(e)
++        return None
++
++
++class StochasticGradientNoise:
++    def __init__(self, full_grad: torch.Tensor):
++        self.full_grad = full_grad
++        self.stochastic_norms = []
++
++    def accumulate(self, module: torch.nn.Module):
++        grad = get_batch_grad(module)
++        if grad is not None:
++            self.stochastic_norms.append((grad - self.full_grad).norm().item())
++    
++    def save(self, path):
++        np.save(path, np.array(self.stochastic_norms))
++
++#----------------------------------------------------------------------------
++
++# no weight updates - this is just used to compute gradients to look at the stochastic noise distribution!
++def dry_training_loop(
++    run_dir                 = '.',      # Output directory.
++    training_set_kwargs     = {},       # Options for training set.
++    data_loader_kwargs      = {},       # Options for torch.utils.data.DataLoader.
++    G_kwargs                = {},       # Options for generator network.
++    D_kwargs                = {},       # Options for discriminator network.
++    G_opt_kwargs            = {},       # Options for generator optimizer.
++    D_opt_kwargs            = {},       # Options for discriminator optimizer.
++    augment_kwargs          = None,     # Options for augmentation pipeline. None = disable.
++    loss_kwargs             = {},       # Options for loss function.
++    metrics                 = [],       # Metrics to evaluate during training.
++    random_seed             = 0,        # Global random seed.
++    num_gpus                = 1,        # Number of GPUs participating in the training.
++    rank                    = 0,        # Rank of the current process in [0, num_gpus[.
++    batch_size              = 4,        # Total batch size for one training iteration. Can be larger than batch_gpu * num_gpus.
++    batch_gpu               = 4,        # Number of samples processed at a time by one GPU.
++    ema_kimg                = 10,       # Half-life of the exponential moving average (EMA) of generator weights.
++    ema_rampup              = 0.05,     # EMA ramp-up coefficient. None = no rampup.
++    G_reg_interval          = None,     # How often to perform regularization for G? None = disable lazy regularization.
++    D_reg_interval          = 16,       # How often to perform regularization for D? None = disable lazy regularization.
++    augment_p               = 0,        # Initial value of augmentation probability.
++    ada_target              = None,     # ADA target value. None = fixed p.
++    ada_interval            = 4,        # How often to perform ADA adjustment?
++    ada_kimg                = 500,      # ADA adjustment speed, measured in how many kimg it takes for p to increase/decrease by one unit.
++    total_kimg              = 25000,    # Total length of the training, measured in thousands of real images.
++    kimg_per_tick           = 4,        # Progress snapshot interval.
++    image_snapshot_ticks    = 50,       # How often to save image snapshots? None = disable.
++    network_snapshot_ticks  = 50,       # How often to save network snapshots? None = disable.
++    resume_pkl              = None,     # Network pickle to resume training from.
++    resume_kimg             = 0,        # First kimg to report when resuming training.
++    cudnn_benchmark         = True,     # Enable torch.backends.cudnn.benchmark?
++    abort_fn                = None,     # Callback function for determining whether to abort training. Must return consistent results across ranks.
++    progress_fn             = None,     # Callback function for updating training progress. Called for all ranks.
++    mode                    = "full",   # Either 'full' or 'stochastic' - full computes a "full" (avg of all mb) grad, "stochastic" computes the diff norms
++    full_grad_generator     = None,     # path to 'full' gradient; if specified, will compute the distribution of stochastic gradient noise 
++    full_grad_discriminator = None      # path to 'full' gradient; if specified, will compute the distribution of stochastic gradient noise 
++):
++    if mode not in ["full", "stochastic"]:
++        raise TypeError(f"Mode must be either 'full' or 'stochastic'; got '{mode}'")
++
++    # Initialize.
++    start_time = time.time()
++    device = torch.device('cuda', rank)
++    np.random.seed(random_seed * num_gpus + rank)
++    torch.manual_seed(random_seed * num_gpus + rank)
++    torch.backends.cudnn.benchmark = cudnn_benchmark    # Improves training speed.
++    torch.backends.cuda.matmul.allow_tf32 = False       # Improves numerical accuracy.
++    torch.backends.cudnn.allow_tf32 = False             # Improves numerical accuracy.
++    conv2d_gradfix.enabled = True                       # Improves training speed.
++    grid_sample_gradfix.enabled = True                  # Avoids errors with the augmentation pipe.
++
++    # Load training set.
++    if rank == 0:
++        print('Loading training set...')
++
++
++    training_set = dnnlib.util.construct_class_by_name(**training_set_kwargs) # subclass of training.dataset.Dataset
++    training_set_sampler = misc.InfiniteSampler(dataset=training_set, rank=rank, num_replicas=num_gpus, seed=random_seed)
++    training_set_iterator = iter(torch.utils.data.DataLoader(dataset=training_set, sampler=training_set_sampler, batch_size=batch_size//num_gpus, **data_loader_kwargs))
++    if rank == 0:
++        print()
++        print('Num images: ', len(training_set))
++        print('Image shape:', training_set.image_shape)
++        print('Label shape:', training_set.label_shape)
++        print()
++
++
++    # Construct networks.
++    if rank == 0:
++        print('Constructing networks...')
++    common_kwargs = dict(c_dim=training_set.label_dim, img_resolution=training_set.resolution, img_channels=training_set.num_channels)
++
++    G = dnnlib.util.construct_class_by_name(**G_kwargs, **common_kwargs).train().requires_grad_(False).to(device) # subclass of torch.nn.Module
++    D = dnnlib.util.construct_class_by_name(**D_kwargs, **common_kwargs).train().requires_grad_(False).to(device) # subclass of torch.nn.Module
++    G_ema = copy.deepcopy(G).eval()
++
++
++    # Resume from existing pickle.
++    if (resume_pkl is not None) and (rank == 0):
++        print(f'Resuming from "{resume_pkl}"')
++        with dnnlib.util.open_url(resume_pkl) as f:
++            resume_data = legacy.load_network_pkl(f)
++        for name, module in [('G', G), ('D', D), ('G_ema', G_ema)]:
++            misc.copy_params_and_buffers(resume_data[name], module, require_all=False)
++
++
++    # Print network summary tables.
++    if rank == 0:
++        z = torch.empty([batch_gpu, G.z_dim], device=device)
++        c = torch.empty([batch_gpu, G.c_dim], device=device)
++        img = misc.print_module_summary(G, [z, c])
++        misc.print_module_summary(D, [img, c])
++
++
++    # Setup augmentation.
++    if rank == 0:
++        print('Setting up augmentation...')
++    augment_pipe = None
++    ada_stats = None
++    if (augment_kwargs is not None) and (augment_p > 0 or ada_target is not None):
++        augment_pipe = dnnlib.util.construct_class_by_name(**augment_kwargs).train().requires_grad_(False).to(device) # subclass of torch.nn.Module
++        augment_pipe.p.copy_(torch.as_tensor(augment_p))
++        if ada_target is not None:
++            ada_stats = training_stats.Collector(regex='Loss/signs/real')
++
++    
++    # Setup stochastic gradient norms accumulation
++    grad_noise_generator = None
++    grad_noise_discriminator = None
++
++    if mode == "stochastic":
++        grad_noise_generator = StochasticGradientNoise(torch.load(full_grad_generator).cuda())
++        grad_noise_discriminator = StochasticGradientNoise(torch.load(full_grad_discriminator).cuda())
++
++    elif mode == "full":
++        loss_kwargs["accumulate_full_gradient"] = True
++    
++    else: 
++        raise TypeError(f"mode is invalid - got '{mode}'")
++
++    # Distribute across GPUs.
++    if rank == 0:
++        print(f'Distributing across {num_gpus} GPUs...')
++    for module in [G, D, G_ema, augment_pipe]:
++        if module is not None and num_gpus > 1:
++            for param in misc.params_and_buffers(module):
++                torch.distributed.broadcast(param, src=0)
++
++
++    # Setup training phases - Generator -> Discriminator
++    if rank == 0:
++        print('Setting up training phases...')
++    
++    loss = dnnlib.util.construct_class_by_name(
++        device=device, G=G, D=D, augment_pipe=augment_pipe, **loss_kwargs
++    ) # subclass of training.loss.Loss
++
++    phases = []
++    for name, module, opt_kwargs, reg_interval in [
++        ('G', G, G_opt_kwargs, G_reg_interval), 
++        ('D', D, D_opt_kwargs, D_reg_interval)
++    ]:
++        if reg_interval is None:
++            opt = dnnlib.util.construct_class_by_name(params=module.parameters(), **opt_kwargs) # subclass of torch.optim.Optimizer
++            phases += [dnnlib.EasyDict(name=name+'both', module=module, opt=opt, interval=1)]
++
++        else: # Lazy regularization.
++            mb_ratio = reg_interval / (reg_interval + 1)
++            opt_kwargs = dnnlib.EasyDict(opt_kwargs)
++            opt_kwargs.lr = opt_kwargs.lr * mb_ratio
++            opt_kwargs.betas = [beta ** mb_ratio for beta in opt_kwargs.betas]
++            opt = dnnlib.util.construct_class_by_name(module.parameters(), **opt_kwargs) # subclass of torch.optim.Optimizer
++            phases += [dnnlib.EasyDict(name=name+'main', module=module, opt=opt, interval=1)]
++            phases += [dnnlib.EasyDict(name=name+'reg', module=module, opt=opt, interval=reg_interval)]
++
++    for phase in phases:
++        phase.start_event = None
++        phase.end_event = None
++        if rank == 0:
++            phase.start_event = torch.cuda.Event(enable_timing=True)
++            phase.end_event = torch.cuda.Event(enable_timing=True)
++
++
++    # Export sample images.
++    grid_size = None
++    grid_z = None
++    grid_c = None
++    if rank == 0:
++        print('Exporting sample images...')
++        grid_size, images, labels = setup_snapshot_image_grid(training_set=training_set)
++        save_image_grid(images, os.path.join(run_dir, 'reals.png'), drange=[0,255], grid_size=grid_size)
++
++        grid_z = torch.randn([labels.shape[0], G.z_dim], device=device).split(batch_gpu)
++        grid_c = torch.from_numpy(labels).to(device).split(batch_gpu)
++        images = torch.cat([G_ema(z=z, c=c, noise_mode='const').cpu() for z, c in zip(grid_z, grid_c)]).numpy()
++        save_image_grid(images, os.path.join(run_dir, 'fakes_init.png'), drange=[-1,1], grid_size=grid_size)
++
++
++    # Initialize logs.
++    if rank == 0:
++        print('Initializing logs...')
++    stats_collector = training_stats.Collector(regex='.*')
++    stats_metrics = dict()
++    stats_jsonl = None
++    stats_tfevents = None
++    if rank == 0:
++        stats_jsonl = open(os.path.join(run_dir, 'stats.jsonl'), 'wt')
++        try:
++            import torch.utils.tensorboard as tensorboard
++            stats_tfevents = tensorboard.SummaryWriter(run_dir)
++        except ImportError as err:
++            print('Skipping tfevents export:', err)
++
++
++    # Train.
++    if rank == 0:
++        print(f'Training for {total_kimg} kimg...')
++        print()
++
++    cur_nimg = resume_kimg * 1000
++    cur_tick = 0
++    tick_start_nimg = cur_nimg
++    tick_start_time = time.time()
++    maintenance_time = tick_start_time - start_time
++    batch_idx = 0
++    if progress_fn is not None:
++        progress_fn(0, total_kimg)
++
++    while True:
++
++        # Fetch training data.
++        with torch.autograd.profiler.record_function('data_fetch'):
++
++            phase_real_img, phase_real_c = next(training_set_iterator)
++            phase_real_img = (phase_real_img.to(device).to(torch.float32) / 127.5 - 1).split(batch_gpu)
++            phase_real_c = phase_real_c.to(device).split(batch_gpu)
++
++            # latent Z - random vector
++            all_gen_z = torch.randn([len(phases) * batch_size, G.z_dim], device=device)
++            all_gen_z = [phase_gen_z.split(batch_gpu) for phase_gen_z in all_gen_z.split(batch_size)]
++
++            # Classes (?) don't really get this
++            all_gen_c = [training_set.get_label(np.random.randint(len(training_set))) for _ in range(len(phases) * batch_size)]
++            all_gen_c = torch.from_numpy(np.stack(all_gen_c)).pin_memory().to(device)
++            all_gen_c = [phase_gen_c.split(batch_gpu) for phase_gen_c in all_gen_c.split(batch_size)]
++
++
++        # Execute training phases - Generator -> Discriminator -> G_main, D_main, G_reg, D_reg, G_both, D_both ?
++        for phase, phase_gen_z, phase_gen_c in zip(phases, all_gen_z, all_gen_c):
++            print(f"Phase: {phase.name}; nimg: {cur_nimg}") 
++
++            if batch_idx % phase.interval != 0:  # skips a step if batch_idx % reg_interval != 0
++                print("Skipping")
++                continue
++
++            if phase.start_event is not None:
++                phase.start_event.record(torch.cuda.current_stream(device))
++
++            # Accumulate gradients.
++            # --> enables grad ONLY on the phase that we're operating on right now (i.e. only G and D at a time)
++            phase.opt.zero_grad(set_to_none=True)
++            phase.module.requires_grad_(True) 
++            for real_img, real_c, gen_z, gen_c in zip(phase_real_img, phase_real_c, phase_gen_z, phase_gen_c):
++
++                # --> computes loss; loss class accumluates gradients and automatically picks which of G/D it optimizes for
++                loss.accumulate_gradients(
++                    phase=phase.name, 
++                    real_img=real_img, 
++                    real_c=real_c, 
++                    gen_z=gen_z, 
++                    gen_c=gen_c, 
++                    gain=phase.interval,  # multiplies the mean by number of intervals its supposed to cover? (for the reg loss)
++                    cur_nimg=cur_nimg
++                )
++
++            if mode == "stochastic":
++                # accumulate generator full gradient
++                if phase.name in ["Gmain", "Greg", "Gboth"]:
++                    grad_noise_generator.accumulate(phase.module)
++
++                # accumulate discriminator full gradient
++                if phase.name in ["Dmain", "Dreg", "Dboth"]:
++                    grad_noise_discriminator.accumulate(phase.module)
++                
++            # --> disables gradients
++            phase.module.requires_grad_(False)
++
++            # Phase done.
++            if phase.end_event is not None:
++                phase.end_event.record(torch.cuda.current_stream(device))
++
++            ########################################################################################
++            
++        # Update state.
++        cur_nimg += batch_size
++        batch_idx += 1
++
++        # Perform maintenance tasks once per tick.
++        done = (cur_nimg >= total_kimg * 1000)
++        if (not done) and (cur_tick != 0) and (cur_nimg < tick_start_nimg + kimg_per_tick * 1000):
++            continue
++
++        # Print status line, accumulating the same information in training_stats.
++        tick_end_time = time.time()
++        fields = []
++        fields += [f"tick {training_stats.report0('Progress/tick', cur_tick):<5d}"]
++        fields += [f"kimg {training_stats.report0('Progress/kimg', cur_nimg / 1e3):<8.1f}"]
++        fields += [f"time {dnnlib.util.format_time(training_stats.report0('Timing/total_sec', tick_end_time - start_time)):<12s}"]
++        fields += [f"sec/tick {training_stats.report0('Timing/sec_per_tick', tick_end_time - tick_start_time):<7.1f}"]
++        fields += [f"sec/kimg {training_stats.report0('Timing/sec_per_kimg', (tick_end_time - tick_start_time) / (cur_nimg - tick_start_nimg) * 1e3):<7.2f}"]
++        fields += [f"maintenance {training_stats.report0('Timing/maintenance_sec', maintenance_time):<6.1f}"]
++        fields += [f"cpumem {training_stats.report0('Resources/cpu_mem_gb', psutil.Process(os.getpid()).memory_info().rss / 2**30):<6.2f}"]
++        fields += [f"gpumem {training_stats.report0('Resources/peak_gpu_mem_gb', torch.cuda.max_memory_allocated(device) / 2**30):<6.2f}"]
++        fields += [f"reserved {training_stats.report0('Resources/peak_gpu_mem_reserved_gb', torch.cuda.max_memory_reserved(device) / 2**30):<6.2f}"]
++        torch.cuda.reset_peak_memory_stats()
++        fields += [f"augment {training_stats.report0('Progress/augment', float(augment_pipe.p.cpu()) if augment_pipe is not None else 0):.3f}"]
++        training_stats.report0('Timing/total_hours', (tick_end_time - start_time) / (60 * 60))
++        training_stats.report0('Timing/total_days', (tick_end_time - start_time) / (24 * 60 * 60))
++        if rank == 0:
++            print(' '.join(fields))
++
++        # Check for abort.
++        if (not done) and (abort_fn is not None) and abort_fn():
++            done = True
++            if rank == 0:
++                print()
++                print('Aborting...')
++
++        # Save image snapshot.
++        if (rank == 0) and (image_snapshot_ticks is not None) and (done or cur_tick % image_snapshot_ticks == 0):
++            images = torch.cat([G_ema(z=z, c=c, noise_mode='const').cpu() for z, c in zip(grid_z, grid_c)]).numpy()
++            save_image_grid(images, os.path.join(run_dir, f'fakes{cur_nimg//1000:06d}.png'), drange=[-1,1], grid_size=grid_size)
++
++        # Save network snapshot.
++        snapshot_pkl = None
++        snapshot_data = None
++        if (network_snapshot_ticks is not None) and (done or cur_tick % network_snapshot_ticks == 0):
++            snapshot_data = dict(G=G, D=D, G_ema=G_ema, augment_pipe=augment_pipe, training_set_kwargs=dict(training_set_kwargs))
++            for key, value in snapshot_data.items():
++                if isinstance(value, torch.nn.Module):
++                    value = copy.deepcopy(value).eval().requires_grad_(False)
++                    if num_gpus > 1:
++                        misc.check_ddp_consistency(value, ignore_regex=r'.*\.[^.]+_(avg|ema)')
++                        for param in misc.params_and_buffers(value):
++                            torch.distributed.broadcast(param, src=0)
++                    snapshot_data[key] = value.cpu()
++                del value # conserve memory
++            snapshot_pkl = os.path.join(run_dir, f'network-snapshot-{cur_nimg//1000:06d}.pkl')
++            if rank == 0:
++                with open(snapshot_pkl, 'wb') as f:
++                    pickle.dump(snapshot_data, f)
++
++        # Evaluate metrics.
++        if (snapshot_data is not None) and (len(metrics) > 0):
++            if rank == 0:
++                print('Evaluating metrics...')
++            for metric in metrics:
++                result_dict = metric_main.calc_metric(metric=metric, G=snapshot_data['G_ema'],
++                    dataset_kwargs=training_set_kwargs, num_gpus=num_gpus, rank=rank, device=device)
++                if rank == 0:
++                    metric_main.report_metric(result_dict, run_dir=run_dir, snapshot_pkl=snapshot_pkl)
++                stats_metrics.update(result_dict.results)
++        del snapshot_data # conserve memory
++
++        # Collect statistics.
++        for phase in phases:
++            value = []
++            if (phase.start_event is not None) and (phase.end_event is not None):
++                phase.end_event.synchronize()
++                value = phase.start_event.elapsed_time(phase.end_event)
++            training_stats.report0('Timing/' + phase.name, value)
++        stats_collector.update()
++        stats_dict = stats_collector.as_dict()
++
++        # Update logs.
++        timestamp = time.time()
++        if stats_jsonl is not None:
++            fields = dict(stats_dict, timestamp=timestamp)
++            stats_jsonl.write(json.dumps(fields) + '\n')
++            stats_jsonl.flush()
++        if stats_tfevents is not None:
++            global_step = int(cur_nimg / 1e3)
++            walltime = timestamp - start_time
++            for name, value in stats_dict.items():
++                stats_tfevents.add_scalar(name, value.mean, global_step=global_step, walltime=walltime)
++            for name, value in stats_metrics.items():
++                stats_tfevents.add_scalar(f'Metrics/{name}', value, global_step=global_step, walltime=walltime)
++            stats_tfevents.flush()
++        if progress_fn is not None:
++            progress_fn(cur_nimg // 1000, total_kimg)
++
++        # Update state.
++        cur_tick += 1
++        tick_start_nimg = cur_nimg
++        tick_start_time = time.time()
++        maintenance_time = tick_start_time - tick_end_time
++        if done:
++            break
++
++    # Done.
++    if rank == 0:
++
++        if mode == "full":
++            print()
++            print(f'Saving full grads to: {run_dir}')
++            loss.save(run_dir)
++
++        elif mode == "stochastic":
++            print()
++            print(f'Saving stochastic noise norms to: {run_dir}')
++            grad_noise_generator.save(os.path.join(run_dir, "generator_stoch_noise.npy"))
++            grad_noise_discriminator.save(os.path.join(run_dir, "discriminator_stoch_noise.npy"))
++
++        print()
++        print('Exiting...')
++
++#----------------------------------------------------------------------------
+diff --git a/training/loss.py b/training/loss.py
+index 5674809..e46ee60 100644
+--- a/training/loss.py
++++ b/training/loss.py
+@@ -14,37 +14,76 @@ from torch_utils import training_stats
+ from torch_utils.ops import conv2d_gradfix
+ from torch_utils.ops import upfirdn2d
+ 
+-#----------------------------------------------------------------------------
++# ----------------------------------------------------------------------------
++
+ 
+ class Loss:
+-    def accumulate_gradients(self, phase, real_img, real_c, gen_z, gen_c, gain, cur_nimg): # to be overridden by subclass
++    def accumulate_gradients(
++        self, phase, real_img, real_c, gen_z, gen_c, gain, cur_nimg
++    ):  # to be overridden by subclass
+         raise NotImplementedError()
+ 
+-#----------------------------------------------------------------------------
++
++# ----------------------------------------------------------------------------
++
++
++def get_batch_grad(model: torch.nn.Module) -> torch.Tensor:
++    """Returns a flattened 1d array of all the parameter gradients"""
++    gr = []
++    for i in model.parameters():
++        if i.requires_grad:
++            gr.append(i.grad.detach().reshape(-1))
++    return torch.cat(gr)
++
++
++# ----------------------------------------------------------------------------
++
+ 
+ class StyleGAN2Loss(Loss):
+-    def __init__(self, device, G, D, augment_pipe=None, r1_gamma=10, style_mixing_prob=0, pl_weight=0, pl_batch_shrink=2, pl_decay=0.01, pl_no_weight_grad=False, blur_init_sigma=0, blur_fade_kimg=0):
++    def __init__(
++        self,
++        device,
++        G,
++        D,
++        augment_pipe=None,
++        r1_gamma=10,
++        style_mixing_prob=0,
++        pl_weight=0,
++        pl_batch_shrink=2,
++        pl_decay=0.01,
++        pl_no_weight_grad=False,
++        blur_init_sigma=0,
++        blur_fade_kimg=0,
++    ):
+         super().__init__()
+-        self.device             = device
+-        self.G                  = G
+-        self.D                  = D
+-        self.augment_pipe       = augment_pipe
+-        self.r1_gamma           = r1_gamma
+-        self.style_mixing_prob  = style_mixing_prob
+-        self.pl_weight          = pl_weight
+-        self.pl_batch_shrink    = pl_batch_shrink
+-        self.pl_decay           = pl_decay
+-        self.pl_no_weight_grad  = pl_no_weight_grad
+-        self.pl_mean            = torch.zeros([], device=device)
+-        self.blur_init_sigma    = blur_init_sigma
+-        self.blur_fade_kimg     = blur_fade_kimg
++        self.device = device
++        self.G = G
++        self.D = D
++        self.augment_pipe = augment_pipe
++        self.r1_gamma = r1_gamma
++        self.style_mixing_prob = style_mixing_prob
++        self.pl_weight = pl_weight
++        self.pl_batch_shrink = pl_batch_shrink
++        self.pl_decay = pl_decay
++        self.pl_no_weight_grad = pl_no_weight_grad
++        self.pl_mean = torch.zeros([], device=device)
++        self.blur_init_sigma = blur_init_sigma
++        self.blur_fade_kimg = blur_fade_kimg
++        # self.compute_noise_gradient = compute_noise_gradient
++        self.full_grad_G = None
++        self.full_grad_D = None
++
+ 
+     def run_G(self, z, c, update_emas=False):
+         ws = self.G.mapping(z, c, update_emas=update_emas)
+         if self.style_mixing_prob > 0:
+-            with torch.autograd.profiler.record_function('style_mixing'):
++            with torch.autograd.profiler.record_function("style_mixing"):
+                 cutoff = torch.empty([], dtype=torch.int64, device=ws.device).random_(1, ws.shape[1])
+-                cutoff = torch.where(torch.rand([], device=ws.device) < self.style_mixing_prob, cutoff, torch.full_like(cutoff, ws.shape[1]))
++                cutoff = torch.where(
++                    torch.rand([], device=ws.device) < self.style_mixing_prob,
++                    cutoff,
++                    torch.full_like(cutoff, ws.shape[1]),
++                )
+                 ws[:, cutoff:] = self.G.mapping(torch.randn_like(z), c, update_emas=False)[:, cutoff:]
+         img = self.G.synthesis(ws, update_emas=update_emas)
+         return img, ws
+@@ -52,7 +91,7 @@ class StyleGAN2Loss(Loss):
+     def run_D(self, img, c, blur_sigma=0, update_emas=False):
+         blur_size = np.floor(blur_sigma * 3)
+         if blur_size > 0:
+-            with torch.autograd.profiler.record_function('blur'):
++            with torch.autograd.profiler.record_function("blur"):
+                 f = torch.arange(-blur_size, blur_size + 1, device=img.device).div(blur_sigma).square().neg().exp2()
+                 img = upfirdn2d.filter2d(img, f / f.sum())
+         if self.augment_pipe is not None:
+@@ -60,81 +99,95 @@ class StyleGAN2Loss(Loss):
+         logits = self.D(img, c, update_emas=update_emas)
+         return logits
+ 
+-    def accumulate_gradients(self, phase, real_img, real_c, gen_z, gen_c, gain, cur_nimg):
+-        assert phase in ['Gmain', 'Greg', 'Gboth', 'Dmain', 'Dreg', 'Dboth']
++    def accumulate_gradients(self, phase, real_img, real_c, gen_z, gen_c, gain, cur_nimg, acc_full_grad: bool = False):
++        assert phase in ["Gmain", "Greg", "Gboth", "Dmain", "Dreg", "Dboth"]
+         if self.pl_weight == 0:
+-            phase = {'Greg': 'none', 'Gboth': 'Gmain'}.get(phase, phase)
++            phase = {"Greg": "none", "Gboth": "Gmain"}.get(phase, phase)
+         if self.r1_gamma == 0:
+-            phase = {'Dreg': 'none', 'Dboth': 'Dmain'}.get(phase, phase)
+-        blur_sigma = max(1 - cur_nimg / (self.blur_fade_kimg * 1e3), 0) * self.blur_init_sigma if self.blur_fade_kimg > 0 else 0
++            phase = {"Dreg": "none", "Dboth": "Dmain"}.get(phase, phase)
++        blur_sigma = (
++            max(1 - cur_nimg / (self.blur_fade_kimg * 1e3), 0) * self.blur_init_sigma if self.blur_fade_kimg > 0 else 0
++        )
+ 
+         # Gmain: Maximize logits for generated images.
+-        if phase in ['Gmain', 'Gboth']:
+-            with torch.autograd.profiler.record_function('Gmain_forward'):
++        if phase in ["Gmain", "Gboth"]:
++
++            with torch.autograd.profiler.record_function("Gmain_forward"):
+                 gen_img, _gen_ws = self.run_G(gen_z, gen_c)
+                 gen_logits = self.run_D(gen_img, gen_c, blur_sigma=blur_sigma)
+-                training_stats.report('Loss/scores/fake', gen_logits)
+-                training_stats.report('Loss/signs/fake', gen_logits.sign())
+-                loss_Gmain = torch.nn.functional.softplus(-gen_logits) # -log(sigmoid(gen_logits))
+-                training_stats.report('Loss/G/loss', loss_Gmain)
+-            with torch.autograd.profiler.record_function('Gmain_backward'):
++                training_stats.report("Loss/scores/fake", gen_logits)
++                training_stats.report("Loss/signs/fake", gen_logits.sign())
++                loss_Gmain = torch.nn.functional.softplus(-gen_logits)  # -log(sigmoid(gen_logits))
++                training_stats.report("Loss/G/loss", loss_Gmain)
++
++            with torch.autograd.profiler.record_function("Gmain_backward"):
+                 loss_Gmain.mean().mul(gain).backward()
+ 
+         # Gpl: Apply path length regularization.
+-        if phase in ['Greg', 'Gboth']:
+-            with torch.autograd.profiler.record_function('Gpl_forward'):
++        if phase in ["Greg", "Gboth"]:
++            with torch.autograd.profiler.record_function("Gpl_forward"):
+                 batch_size = gen_z.shape[0] // self.pl_batch_shrink
+                 gen_img, gen_ws = self.run_G(gen_z[:batch_size], gen_c[:batch_size])
+                 pl_noise = torch.randn_like(gen_img) / np.sqrt(gen_img.shape[2] * gen_img.shape[3])
+-                with torch.autograd.profiler.record_function('pl_grads'), conv2d_gradfix.no_weight_gradients(self.pl_no_weight_grad):
+-                    pl_grads = torch.autograd.grad(outputs=[(gen_img * pl_noise).sum()], inputs=[gen_ws], create_graph=True, only_inputs=True)[0]
++                with torch.autograd.profiler.record_function("pl_grads"), conv2d_gradfix.no_weight_gradients(
++                    self.pl_no_weight_grad
++                ):
++                    pl_grads = torch.autograd.grad(
++                        outputs=[(gen_img * pl_noise).sum()], inputs=[gen_ws], create_graph=True, only_inputs=True
++                    )[0]
+                 pl_lengths = pl_grads.square().sum(2).mean(1).sqrt()
+                 pl_mean = self.pl_mean.lerp(pl_lengths.mean(), self.pl_decay)
+                 self.pl_mean.copy_(pl_mean.detach())
+                 pl_penalty = (pl_lengths - pl_mean).square()
+-                training_stats.report('Loss/pl_penalty', pl_penalty)
++                training_stats.report("Loss/pl_penalty", pl_penalty)
+                 loss_Gpl = pl_penalty * self.pl_weight
+-                training_stats.report('Loss/G/reg', loss_Gpl)
+-            with torch.autograd.profiler.record_function('Gpl_backward'):
++                training_stats.report("Loss/G/reg", loss_Gpl)
++            with torch.autograd.profiler.record_function("Gpl_backward"):
+                 loss_Gpl.mean().mul(gain).backward()
+ 
+         # Dmain: Minimize logits for generated images.
+         loss_Dgen = 0
+-        if phase in ['Dmain', 'Dboth']:
+-            with torch.autograd.profiler.record_function('Dgen_forward'):
++        if phase in ["Dmain", "Dboth"]:
++            with torch.autograd.profiler.record_function("Dgen_forward"):
+                 gen_img, _gen_ws = self.run_G(gen_z, gen_c, update_emas=True)
+                 gen_logits = self.run_D(gen_img, gen_c, blur_sigma=blur_sigma, update_emas=True)
+-                training_stats.report('Loss/scores/fake', gen_logits)
+-                training_stats.report('Loss/signs/fake', gen_logits.sign())
+-                loss_Dgen = torch.nn.functional.softplus(gen_logits) # -log(1 - sigmoid(gen_logits))
+-            with torch.autograd.profiler.record_function('Dgen_backward'):
++                training_stats.report("Loss/scores/fake", gen_logits)
++                training_stats.report("Loss/signs/fake", gen_logits.sign())
++                loss_Dgen = torch.nn.functional.softplus(gen_logits)  # -log(1 - sigmoid(gen_logits))
++            with torch.autograd.profiler.record_function("Dgen_backward"):
+                 loss_Dgen.mean().mul(gain).backward()
+ 
+         # Dmain: Maximize logits for real images.
+         # Dr1: Apply R1 regularization.
+-        if phase in ['Dmain', 'Dreg', 'Dboth']:
+-            name = 'Dreal' if phase == 'Dmain' else 'Dr1' if phase == 'Dreg' else 'Dreal_Dr1'
+-            with torch.autograd.profiler.record_function(name + '_forward'):
+-                real_img_tmp = real_img.detach().requires_grad_(phase in ['Dreg', 'Dboth'])
++        if phase in ["Dmain", "Dreg", "Dboth"]:
++            name = "Dreal" if phase == "Dmain" else "Dr1" if phase == "Dreg" else "Dreal_Dr1"
++            with torch.autograd.profiler.record_function(name + "_forward"):
++                real_img_tmp = real_img.detach().requires_grad_(phase in ["Dreg", "Dboth"])
+                 real_logits = self.run_D(real_img_tmp, real_c, blur_sigma=blur_sigma)
+-                training_stats.report('Loss/scores/real', real_logits)
+-                training_stats.report('Loss/signs/real', real_logits.sign())
++                training_stats.report("Loss/scores/real", real_logits)
++                training_stats.report("Loss/signs/real", real_logits.sign())
+ 
+                 loss_Dreal = 0
+-                if phase in ['Dmain', 'Dboth']:
+-                    loss_Dreal = torch.nn.functional.softplus(-real_logits) # -log(sigmoid(real_logits))
+-                    training_stats.report('Loss/D/loss', loss_Dgen + loss_Dreal)
++                if phase in ["Dmain", "Dboth"]:
++                    loss_Dreal = torch.nn.functional.softplus(-real_logits)  # -log(sigmoid(real_logits))
++                    training_stats.report("Loss/D/loss", loss_Dgen + loss_Dreal)
+ 
+                 loss_Dr1 = 0
+-                if phase in ['Dreg', 'Dboth']:
+-                    with torch.autograd.profiler.record_function('r1_grads'), conv2d_gradfix.no_weight_gradients():
+-                        r1_grads = torch.autograd.grad(outputs=[real_logits.sum()], inputs=[real_img_tmp], create_graph=True, only_inputs=True)[0]
+-                    r1_penalty = r1_grads.square().sum([1,2,3])
++                if phase in ["Dreg", "Dboth"]:
++                    with torch.autograd.profiler.record_function("r1_grads"), conv2d_gradfix.no_weight_gradients():
++                        r1_grads = torch.autograd.grad(
++                            outputs=[real_logits.sum()], inputs=[real_img_tmp], create_graph=True, only_inputs=True
++                        )[0]
++                    r1_penalty = r1_grads.square().sum([1, 2, 3])
+                     loss_Dr1 = r1_penalty * (self.r1_gamma / 2)
+-                    training_stats.report('Loss/r1_penalty', r1_penalty)
+-                    training_stats.report('Loss/D/reg', loss_Dr1)
++                    training_stats.report("Loss/r1_penalty", r1_penalty)
++                    training_stats.report("Loss/D/reg", loss_Dr1)
+ 
+-            with torch.autograd.profiler.record_function(name + '_backward'):
++            with torch.autograd.profiler.record_function(name + "_backward"):
+                 (loss_Dreal + loss_Dr1).mean().mul(gain).backward()
+ 
+-#----------------------------------------------------------------------------
++
++    def clear_full_grad(self):
++        self.full_grad_G = None
++        self.full_grad_D = None
++# ----------------------------------------------------------------------------
+diff --git a/training/optim.py b/training/optim.py
+new file mode 100644
+index 0000000..af8cbc8
+--- /dev/null
++++ b/training/optim.py
+@@ -0,0 +1,536 @@
++#  MIT License
++
++# Permission is hereby granted, free of charge, to any person obtaining a copy
++# of this software and associated documentation files (the "Software"), to deal
++# in the Software without restriction, including without limitation the rights
++# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++# copies of the Software, and to permit persons to whom the Software is
++# furnished to do so, subject to the following conditions:
++
++# The above copyright notice and this permission notice shall be included in all
++# copies or substantial portions of the Software.
++
++# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++# SOFTWARE.
++
++import math
++from numpy import ones_like
++import torch
++from torch.optim import Optimizer
++import torch.optim._functional as F
++
++required = object()
++
++
++class Extragradient(Optimizer):
++    """Base class for optimizers with extrapolation step.
++        Arguments:
++        params (iterable): an iterable of :class:`torch.Tensor` s or
++            :class:`dict` s. Specifies what Tensors should be optimized.
++        defaults: (dict): a dict containing default values of optimization
++            options (used when a parameter group doesn't specify them).
++    """
++    def __init__(self, params, defaults):
++        super(Extragradient, self).__init__(params, defaults)
++        self.params_copy = []
++
++    def update(self, p, group):
++        raise NotImplementedError
++
++    def extrapolation(self):
++        """Performs the extrapolation step and save a copy of the current parameters for the update step.
++        """
++        # Check if a copy of the parameters was already made.
++        is_empty = len(self.params_copy) == 0
++        for group in self.param_groups:
++            for p in group['params']:
++                u = self.update(p, group)
++                if is_empty:
++                    # Save the current parameters for the update step. Several extrapolation step can be 
++                    # made before each update but only the parameters before the first extrapolation step are saved.
++                    self.params_copy.append(p.data.clone())
++                if u is None:
++                    continue
++                # Update the current parameters
++                p.data.add_(u)
++
++    def step(self, closure=None):
++        """Performs a single optimization step.
++        Arguments:
++            closure (callable, optional): A closure that reevaluates the model
++                and returns the loss.
++        """
++        if len(self.params_copy) == 0:
++            raise RuntimeError('Need to call extrapolation before calling step.')
++
++        loss = None
++        if closure is not None:
++            loss = closure()
++
++        i = -1
++        for group in self.param_groups:
++            for p in group['params']:
++                i += 1
++                u = self.update(p, group)
++                if u is None:
++                    continue
++                # Update the parameters saved during the extrapolation step
++                p.data = self.params_copy[i].add_(u)
++
++
++        # Free the old parameters
++        self.params_copy = []
++        return loss
++
++class ExtraSGD(Extragradient):
++    """Implements stochastic gradient descent with extrapolation step (optionally with momentum).
++    Nesterov momentum is based on the formula from
++    `On the importance of initialization and momentum in deep learning`__.
++    Args:
++        params (iterable): iterable of parameters to optimize or dicts defining
++            parameter groups
++        lr (float): learning rate
++        momentum (float, optional): momentum factor (default: 0)
++        weight_decay (float, optional): weight decay (L2 penalty) (default: 0)
++        dampening (float, optional): dampening for momentum (default: 0)
++        nesterov (bool, optional): enables Nesterov momentum (default: False)
++    Example:
++        >>> optimizer = torch.optim.ExtraSGD(model.parameters(), lr=0.1, momentum=0.9)
++        >>> optimizer.zero_grad()
++        >>> loss_fn(model(input), target).backward()
++        >>> optimizer.extrapolation()
++        >>> optimizer.zero_grad()
++        >>> loss_fn(model(input), target).backward()
++        >>> optimizer.step()
++    __ http://www.cs.toronto.edu/%7Ehinton/absps/momentum.pdf
++    .. note::
++        The implementation of SGD with Momentum/Nesterov subtly differs from
++        Sutskever et. al. and implementations in some other frameworks.
++        Considering the specific case of Momentum, the update can be written as
++        .. math::
++                  v = \rho * v + g \\
++                  p = p - lr * v
++        where p, g, v and :math:`\rho` denote the parameters, gradient,
++        velocity, and momentum respectively.
++        This is in contrast to Sutskever et. al. and
++        other frameworks which employ an update of the form
++        .. math::
++             v = \rho * v + lr * g \\
++             p = p - v
++        The Nesterov version is analogously modified.
++    """
++    def __init__(self, params, lr=required, momentum=0, dampening=0,
++                 weight_decay=0, nesterov=False):
++        if lr is not required and lr < 0.0:
++            raise ValueError("Invalid learning rate: {}".format(lr))
++        if momentum < 0.0:
++            raise ValueError("Invalid momentum value: {}".format(momentum))
++        if weight_decay < 0.0:
++            raise ValueError("Invalid weight_decay value: {}".format(weight_decay))
++
++        defaults = dict(lr=lr, momentum=momentum, dampening=dampening,
++                        weight_decay=weight_decay, nesterov=nesterov)
++        if nesterov and (momentum <= 0 or dampening != 0):
++            raise ValueError("Nesterov momentum requires a momentum and zero dampening")
++        super(ExtraSGD, self).__init__(params, defaults)
++
++    def __setstate__(self, state):
++        super(ExtraSGD, self).__setstate__(state)
++        for group in self.param_groups:
++            group.setdefault('nesterov', False)
++
++    def update(self, p, group):
++        weight_decay = group['weight_decay']
++        momentum = group['momentum']
++        dampening = group['dampening']
++        nesterov = group['nesterov']
++
++        if p.grad is None:
++            return None
++        d_p = p.grad.data
++        if weight_decay != 0:
++            d_p.add_(weight_decay, p.data)
++        if momentum != 0:
++            param_state = self.state[p]
++            if 'momentum_buffer' not in param_state:
++                buf = param_state['momentum_buffer'] = torch.zeros_like(p.data)
++                buf.mul_(momentum).add_(d_p)
++            else:
++                buf = param_state['momentum_buffer']
++                buf.mul_(momentum).add_(1 - dampening, d_p)
++            if nesterov:
++                d_p = d_p.add(momentum, buf)
++            else:
++                d_p = buf
++
++        return -group['lr']*d_p
++
++
++class ExtraAdam(Extragradient):
++    """Implements the Adam algorithm with extrapolation step.
++    Arguments:
++        params (iterable): iterable of parameters to optimize or dicts defining
++            parameter groups
++        lr (float, optional): learning rate (default: 1e-3)
++        betas (Tuple[float, float], optional): coefficients used for computing
++            running averages of gradient and its square (default: (0.9, 0.999))
++        eps (float, optional): term added to the denominator to improve
++            numerical stability (default: 1e-8)
++        weight_decay (float, optional): weight decay (L2 penalty) (default: 0)
++        amsgrad (boolean, optional): whether to use the AMSGrad variant of this
++            algorithm from the paper `On the Convergence of Adam and Beyond`_
++    """
++
++    def __init__(self, params, lr=1e-3, betas=(0.9, 0.999), eps=1e-8,
++                 weight_decay=0, amsgrad=False):
++        if not 0.0 <= lr:
++         raise ValueError("Invalid learning rate: {}".format(lr))
++        if not 0.0 <= eps:
++         raise ValueError("Invalid epsilon value: {}".format(eps))
++        if not 0.0 <= betas[0] < 1.0:
++         raise ValueError("Invalid beta parameter at index 0: {}".format(betas[0]))
++        if not 0.0 <= betas[1] < 1.0:
++         raise ValueError("Invalid beta parameter at index 1: {}".format(betas[1]))
++        defaults = dict(lr=lr, betas=betas, eps=eps,
++                     weight_decay=weight_decay, amsgrad=amsgrad)
++        super(ExtraAdam, self).__init__(params, defaults)
++
++    def __setstate__(self, state):
++        super(ExtraAdam, self).__setstate__(state)
++        for group in self.param_groups:
++            group.setdefault('amsgrad', False)
++
++    def update(self, p, group):
++        if p.grad is None:
++            return None
++        grad = p.grad.data
++        if grad.is_sparse:
++            raise RuntimeError('Adam does not support sparse gradients, please consider SparseAdam instead')
++        amsgrad = group['amsgrad']
++
++        state = self.state[p]
++
++        # State initialization
++        if len(state) == 0:
++            state['step'] = 0
++            # Exponential moving average of gradient values
++            state['exp_avg'] = torch.zeros_like(p.data)
++            # Exponential moving average of squared gradient values
++            state['exp_avg_sq'] = torch.zeros_like(p.data)
++            if amsgrad:
++                # Maintains max of all exp. moving avg. of sq. grad. values
++                state['max_exp_avg_sq'] = torch.zeros_like(p.data)
++
++        exp_avg, exp_avg_sq = state['exp_avg'], state['exp_avg_sq']
++        if amsgrad:
++            max_exp_avg_sq = state['max_exp_avg_sq']
++        beta1, beta2 = group['betas']
++
++        state['step'] += 1
++
++        if group['weight_decay'] != 0:
++            grad = grad.add(group['weight_decay'], p.data)
++
++        # Decay the first and second moment running average coefficient
++        exp_avg.mul_(beta1).add_(1 - beta1, grad)
++        exp_avg_sq.mul_(beta2).addcmul_(1 - beta2, grad, grad)
++        if amsgrad:
++            # Maintains the maximum of all 2nd moment running avg. till now
++            torch.max(max_exp_avg_sq, exp_avg_sq, out=max_exp_avg_sq)
++            # Use the max. for normalizing running avg. of gradient
++            denom = max_exp_avg_sq.sqrt().add_(group['eps'])
++        else:
++            denom = exp_avg_sq.sqrt().add_(group['eps'])
++
++        bias_correction1 = 1 - beta1 ** state['step']
++        bias_correction2 = 1 - beta2 ** state['step']
++        step_size = group['lr'] * math.sqrt(bias_correction2) / bias_correction1
++
++        return -step_size*exp_avg/denom
++
++
++class OMD(Optimizer):
++    def __init__(self, params, lr=required):
++        if lr is not required and lr < 0.0:
++            raise ValueError("Invalid learning rate: {}".format(lr))
++        defaults = dict(lr=lr)
++        super(OMD, self).__init__(params, defaults)
++
++    def __setstate__(self, state):
++        super(OMD, self).__setstate__(state)
++
++    def step(self, closure=None):
++        loss = None
++        if closure is not None:
++            loss = closure()
++
++        for group in self.param_groups:
++            for p in group['params']:
++                if p.grad is None:
++                    continue
++
++                d_p = p.grad.data
++
++                state = self.state[p]
++
++                # State initialization
++                if len(state) == 0:
++                    state['previous_update'] = torch.zeros_like(d_p)
++
++                p.data.add_(-2*group['lr'], d_p).add_(group['lr']*state['previous_update'])
++
++                state['previous_update'] = d_p
++
++        return loss
++
++
++class OptimisticAdam(Optimizer):
++    def __init__(self, params, lr=1e-3, betas=(0.9, 0.999), eps=1e-8,
++                 weight_decay=0, amsgrad=False):
++        if not 0.0 <= lr:
++         raise ValueError("Invalid learning rate: {}".format(lr))
++        if not 0.0 <= eps:
++         raise ValueError("Invalid epsilon value: {}".format(eps))
++        if not 0.0 <= betas[0] < 1.0:
++         raise ValueError("Invalid beta parameter at index 0: {}".format(betas[0]))
++        if not 0.0 <= betas[1] < 1.0:
++         raise ValueError("Invalid beta parameter at index 1: {}".format(betas[1]))
++        defaults = dict(lr=lr, betas=betas, eps=eps,
++                     weight_decay=weight_decay, amsgrad=amsgrad)
++        super(OptimisticAdam, self).__init__(params, defaults)
++
++    def __setstate__(self, state):
++        super(OptimisticAdam, self).__setstate__(state)
++        for group in self.param_groups:
++            group.setdefault('amsgrad', False)
++
++    def step(self, closure=None):
++        loss = None
++        if closure is not None:
++            loss = closure()
++
++        for group in self.param_groups:
++            for p in group['params']:
++                if p.grad is None:
++                    return None
++                grad = p.grad.data
++                if grad.is_sparse:
++                    raise RuntimeError('Adam does not support sparse gradients, please consider SparseAdam instead')
++                amsgrad = group['amsgrad']
++
++                state = self.state[p]
++
++                # State initialization
++                if len(state) == 0:
++                    state['step'] = 0
++                    # Exponential moving average of gradient values
++                    state['exp_avg'] = torch.zeros_like(p.data)
++                    # Exponential moving average of squared gradient values
++                    state['exp_avg_sq'] = torch.zeros_like(p.data)
++                    if amsgrad:
++                        # Maintains max of all exp. moving avg. of sq. grad. values
++                        state['max_exp_avg_sq'] = torch.zeros_like(p.data)
++
++                exp_avg, exp_avg_sq = state['exp_avg'], state['exp_avg_sq']
++                if amsgrad:
++                    max_exp_avg_sq = state['max_exp_avg_sq']
++                beta1, beta2 = group['betas']
++
++                state['step'] += 1
++
++                if group['weight_decay'] != 0:
++                    grad = grad.add(group['weight_decay'], p.data)
++
++                # Decay the first and second moment running average coefficient
++                exp_avg.mul_(beta1).add_(1 - beta1, grad)
++                exp_avg_sq.mul_(beta2).addcmul_(1 - beta2, grad, grad)
++                if amsgrad:
++                    # Maintains the maximum of all 2nd moment running avg. till now
++                    torch.max(max_exp_avg_sq, exp_avg_sq, out=max_exp_avg_sq)
++                    # Use the max. for normalizing running avg. of gradient
++                    denom = max_exp_avg_sq.sqrt().add_(group['eps'])
++                else:
++                    denom = exp_avg_sq.sqrt().add_(group['eps'])
++
++                bias_correction1 = 1 - beta1 ** state['step']
++                bias_correction2 = 1 - beta2 ** state['step']
++                step_size = group['lr'] * math.sqrt(bias_correction2) / bias_correction1
++
++                p.data.addcdiv_(-2*step_size, exp_avg, denom)
++
++                if state['step'] > 1:
++                    p.data.addcdiv_(group['lr'], state['exp_avg_previous'], state['exp_avg_sq_previous'])
++
++                state['exp_avg_previous'] = exp_avg.clone()/(bias_correction1)
++                state['exp_avg_sq_previous'] = denom.clone()/math.sqrt(bias_correction2)
++
++        return loss
++
++
++class NormalizedSGD(Optimizer):
++    def __init__(self, params, lr=required, momentum=0, dampening=0,
++                 weight_decay=0, nesterov=False): #*, maximize=False):
++        if lr is not required and lr < 0.0:
++            raise ValueError("Invalid learning rate: {}".format(lr))
++        if momentum < 0.0:
++            raise ValueError("Invalid momentum value: {}".format(momentum))
++        if weight_decay < 0.0:
++            raise ValueError("Invalid weight_decay value: {}".format(weight_decay))
++
++        defaults = dict(lr=lr, momentum=momentum, dampening=dampening,
++                        weight_decay=weight_decay, nesterov=nesterov) # , maximize=maximize)
++        if nesterov and (momentum <= 0 or dampening != 0):
++            raise ValueError("Nesterov momentum requires a momentum and zero dampening")
++        super(NormalizedSGD, self).__init__(params, defaults)
++
++    def __setstate__(self, state):
++        super(NormalizedSGD, self).__setstate__(state)
++        for group in self.param_groups:
++            group.setdefault('nesterov', False)
++            # group.setdefault('maximize', False)
++
++
++    @torch.no_grad()
++    def step(self, closure=None):
++        """Performs a single optimization step.
++
++        Args:
++            closure (callable, optional): A closure that reevaluates the model
++                and returns the loss.
++        """
++        loss = None
++        if closure is not None:
++            with torch.enable_grad():
++                loss = closure()
++
++        for group in self.param_groups:
++            params_with_grad = []
++            d_p_list = []
++            momentum_buffer_list = []
++            weight_decay = group['weight_decay']
++            momentum = group['momentum']
++            dampening = group['dampening']
++            nesterov = group['nesterov']
++            # maximize = group['maximize']
++            lr = group['lr']
++
++            device = group['params'][0].device
++            norm = torch.tensor(1e-8, device=device)  # epsilon
++            for p in group['params']:
++                if p.grad is not None:
++                    norm += (p.grad ** 2).sum()
++            torch.sqrt_(norm)
++
++            for p in group['params']:
++                if p.grad is not None:
++
++                    # scale by norm of full gradient
++                    p.grad.data /= norm
++
++                    params_with_grad.append(p)
++                    d_p_list.append(p.grad)
++
++                    state = self.state[p]
++                    if 'momentum_buffer' not in state:
++                        momentum_buffer_list.append(None)
++                    else:
++                        momentum_buffer_list.append(state['momentum_buffer'])
++
++            F.sgd(params_with_grad,
++                  d_p_list,
++                  momentum_buffer_list,
++                  weight_decay=weight_decay,
++                  momentum=momentum,
++                  lr=lr,
++                  dampening=dampening,
++                  nesterov=nesterov,
++                #   maximize=maximize,
++                  )
++
++            # update momentum_buffers in state
++            for p, momentum_buffer in zip(params_with_grad, momentum_buffer_list):
++                state = self.state[p]
++                state['momentum_buffer'] = momentum_buffer
++
++        return loss
++
++
++class DefaultACClip(Optimizer):
++    def __init__(self, params, lr=1e-4, betas=(0.9, 0.99), eps=1e-5,
++                 weight_decay=1e-5, alpha=2, mod=1):
++        if not 0.0 <= lr:
++            raise ValueError("Invalid learning rate: {}".format(lr))
++        if not 0.0 <= eps:
++            raise ValueError("Invalid epsilon value: {}".format(eps))
++        if not 0.0 <= betas[0] < 1.0:
++            raise ValueError("Invalid beta parameter at index 0: {}".format(betas[0]))
++        if not 0.0 <= betas[1] < 1.0:
++            raise ValueError("Invalid beta parameter at index 1: {}".format(betas[1]))
++        if not 1.0 <= alpha <= 2.0:
++            raise ValueError("Invalid alpha parameter: {}".format(alpha))
++
++        defaults = dict(lr=lr, betas=betas, eps=eps,
++                        weight_decay=weight_decay, alpha=alpha, mod=mod)
++        super(DefaultACClip, self).__init__(params, defaults)
++
++    def __setstate__(self, state):
++        super(DefaultACClip, self).__setstate__(state)
++
++    def step(self, closure=None):
++
++        loss = None
++        if closure is not None:
++            loss = closure()
++
++        for group in self.param_groups:
++            for p in group['params']:
++                if p.grad is None:
++                    continue
++                grad = p.grad.data
++                if grad.is_sparse:
++                    raise RuntimeError('ACClip does not support sparse gradients')
++
++                state = self.state[p]
++
++                # State initialization
++                if len(state) == 0:
++                    # the momentum term, i.e., m_0
++                    state['momentum'] = torch.zeros_like(p.data)
++                    # the clipping value, i.e., \tao_0^{\alpha}
++                    state['clip'] = torch.zeros_like(p.data)
++                    # second-order momentum, i.e., v_t
++                    state['second_moment'] = torch.zeros_like(p.data)
++                    # the number of step in total
++                    state['step'] = 0
++
++                state['step'] += 1
++                momentum, clip, second_moment = state['momentum'], state['clip'], state['second_moment']
++                beta1, beta2 = group['betas']
++                # bias_decay1 = 1 - beta1 ** state['step']
++                # bias_decay2 = 1 - beta2 ** state['step']
++
++                alpha = group['alpha']
++
++                if group['weight_decay'] != 0:
++                    grad.add_(group['weight_decay'], p.data)
++
++                # update momentum and clip
++                momentum.mul_(beta1).add_(1 - beta1, grad)
++                clip.mul_(beta2).add_(1 - beta2, grad.abs().pow(alpha))
++                second_moment.mul_(beta2).addcmul_(1-beta2, grad, grad)
++
++                # truncate large gradient
++                denom = clip.pow(1/alpha).div(momentum.abs().add(group['eps'])).clamp(min=0.0, max=1.0)
++
++                # calculate eta_t
++                if group['mod'] == 1:
++                    denom.div_((second_moment.mul(beta2).sqrt()).add(group['eps']))
++                step_size = group['lr']
++                p.data.addcmul_(-step_size, denom, momentum)
++
++        return loss
+\ No newline at end of file
+diff --git a/training/training_loop.py b/training/training_loop.py
+index ddd0c15..7e53474 100644
+--- a/training/training_loop.py
++++ b/training/training_loop.py
+@@ -8,6 +8,7 @@
+ 
+ """Main training loop."""
+ 
++from email import generator
+ import os
+ import time
+ import copy
+@@ -67,6 +68,19 @@ def setup_snapshot_image_grid(training_set, random_seed=0):
+ 
+ #----------------------------------------------------------------------------
+ 
++def get_clip_fn(mode: str, **kwargs):
++    if mode == "norm":
++        # params: max_norm, norm_type
++        fn = torch.nn.utils.clip_grad.clip_grad_norm_
++    elif mode == "value":
++        # params: clip_value
++        fn = torch.nn.utils.clip_grad.clip_grad_value_
++    def _clip_fn(parameters):
++        return fn(parameters, **kwargs)
++    return _clip_fn
++
++#----------------------------------------------------------------------------
++
+ def save_image_grid(img, fname, drange, grid_size):
+     lo, hi = drange
+     img = np.asarray(img, dtype=np.float32)
+@@ -87,6 +101,20 @@ def save_image_grid(img, fname, drange, grid_size):
+ 
+ #----------------------------------------------------------------------------
+ 
++def get_batch_grad(model: torch.nn.Module) -> torch.Tensor:
++    """Returns a flattened 1d array of all the parameter gradients"""
++    gr = []
++    try:
++        for i in model.parameters():
++            if i.requires_grad:
++                gr.append(i.grad.detach().reshape(-1))
++        return torch.cat(gr)
++
++    except AttributeError as e:
++        return None
++
++#----------------------------------------------------------------------------
++
+ def training_loop(
+     run_dir                 = '.',      # Output directory.
+     training_set_kwargs     = {},       # Options for training set.
+@@ -120,6 +148,10 @@ def training_loop(
+     cudnn_benchmark         = True,     # Enable torch.backends.cudnn.benchmark?
+     abort_fn                = None,     # Callback function for determining whether to abort training. Must return consistent results across ranks.
+     progress_fn             = None,     # Callback function for updating training progress. Called for all ranks.
++    log_grad_hist           = False,
++    log_update_norm         = False, 
++    G_clip_kwargs           = {},
++    D_clip_kwargs           = {},
+ ):
+     # Initialize.
+     start_time = time.time()
+@@ -132,9 +164,17 @@ def training_loop(
+     conv2d_gradfix.enabled = True                       # Improves training speed.
+     grid_sample_gradfix.enabled = True                  # Avoids errors with the augmentation pipe.
+ 
++    # TODO: temporary way of doing this (yuck)
++    EXTRA_OPTIMIZERS = ['training.optim.ExtraAdam', 'training.optim.OptimisticAdam', 'training.optim.ExtraSGD']
++    extrapolation_optimizer = G_opt_kwargs['class_name'] in EXTRA_OPTIMIZERS
++    if extrapolation_optimizer:
++        print(f'\n\n\n\t\tUsing an extragradient operator: {G_opt_kwargs["class_name"]}\n\n')
++    ###########################################################
++
+     # Load training set.
+     if rank == 0:
+         print('Loading training set...')
++
+     training_set = dnnlib.util.construct_class_by_name(**training_set_kwargs) # subclass of training.dataset.Dataset
+     training_set_sampler = misc.InfiniteSampler(dataset=training_set, rank=rank, num_replicas=num_gpus, seed=random_seed)
+     training_set_iterator = iter(torch.utils.data.DataLoader(dataset=training_set, sampler=training_set_sampler, batch_size=batch_size//num_gpus, **data_loader_kwargs))
+@@ -187,23 +227,36 @@ def training_loop(
+             for param in misc.params_and_buffers(module):
+                 torch.distributed.broadcast(param, src=0)
+ 
+-    # Setup training phases.
++    # Setup training phases - Generator -> Discriminator
+     if rank == 0:
+         print('Setting up training phases...')
+     loss = dnnlib.util.construct_class_by_name(device=device, G=G, D=D, augment_pipe=augment_pipe, **loss_kwargs) # subclass of training.loss.Loss
+     phases = []
+-    for name, module, opt_kwargs, reg_interval in [('G', G, G_opt_kwargs, G_reg_interval), ('D', D, D_opt_kwargs, D_reg_interval)]:
++    for name, module, opt_kwargs, reg_interval, clip_kwargs in [
++        ('G', G, G_opt_kwargs, G_reg_interval, G_clip_kwargs), 
++        ('D', D, D_opt_kwargs, D_reg_interval, D_clip_kwargs)
++    ]:
++        clip_fn = lambda x: None
++        if clip_kwargs:
++            clip_fn = get_clip_fn(**clip_kwargs)
++
++        print(f'Name: {name}, Reg interval: {reg_interval}')
+         if reg_interval is None:
+             opt = dnnlib.util.construct_class_by_name(params=module.parameters(), **opt_kwargs) # subclass of torch.optim.Optimizer
+-            phases += [dnnlib.EasyDict(name=name+'both', module=module, opt=opt, interval=1)]
++            phases += [dnnlib.EasyDict(name=name+'both', module=module, opt=opt, interval=1, clip_fn=clip_fn)]
++
+         else: # Lazy regularization.
+             mb_ratio = reg_interval / (reg_interval + 1)
+             opt_kwargs = dnnlib.EasyDict(opt_kwargs)
+             opt_kwargs.lr = opt_kwargs.lr * mb_ratio
+-            opt_kwargs.betas = [beta ** mb_ratio for beta in opt_kwargs.betas]
++            if 'betas' in opt_kwargs:
++                opt_kwargs.betas = [beta ** mb_ratio for beta in opt_kwargs.betas]
++            # if 'momentum' in opt_kwargs:
++            #     opt_kwargs.momentum = [m ** mb_ratio for m in opt_kwargs.momentum]
+             opt = dnnlib.util.construct_class_by_name(module.parameters(), **opt_kwargs) # subclass of torch.optim.Optimizer
+-            phases += [dnnlib.EasyDict(name=name+'main', module=module, opt=opt, interval=1)]
+-            phases += [dnnlib.EasyDict(name=name+'reg', module=module, opt=opt, interval=reg_interval)]
++            phases += [dnnlib.EasyDict(name=name+'main', module=module, opt=opt, interval=1, clip_fn=clip_fn)]
++            phases += [dnnlib.EasyDict(name=name+'reg', module=module, opt=opt, interval=reg_interval, clip_fn=clip_fn)]
++    
+     for phase in phases:
+         phase.start_event = None
+         phase.end_event = None
+@@ -249,10 +302,12 @@ def training_loop(
+     tick_start_time = time.time()
+     maintenance_time = tick_start_time - start_time
+     batch_idx = 0
++
+     if progress_fn is not None:
+         progress_fn(0, total_kimg)
+-    while True:
+ 
++
++    while True:
+         # Fetch training data.
+         with torch.autograd.profiler.record_function('data_fetch'):
+             phase_real_img, phase_real_c = next(training_set_iterator)
+@@ -264,18 +319,52 @@ def training_loop(
+             all_gen_c = torch.from_numpy(np.stack(all_gen_c)).pin_memory().to(device)
+             all_gen_c = [phase_gen_c.split(batch_gpu) for phase_gen_c in all_gen_c.split(batch_size)]
+ 
+-        # Execute training phases.
++        generator_grads = []
++        discriminator_grads = []
++
++        generator_update_norms = 0.
++        discriminator_update_norms = 0.
++
++        # Execute training phases - Generator -> Discriminator -> G -> D ...
++        # also accounts for either computing the main loss or the path length regularizer loss or both
++        # uses phase.interval as a switch to control what loss is applied when
+         for phase, phase_gen_z, phase_gen_c in zip(phases, all_gen_z, all_gen_c):
+             if batch_idx % phase.interval != 0:
+                 continue
+             if phase.start_event is not None:
+                 phase.start_event.record(torch.cuda.current_stream(device))
+ 
++            # extrapolation from the past
++            if extrapolation_optimizer:
++                phase.opt.extrapolation()
++
+             # Accumulate gradients.
+             phase.opt.zero_grad(set_to_none=True)
+             phase.module.requires_grad_(True)
+             for real_img, real_c, gen_z, gen_c in zip(phase_real_img, phase_real_c, phase_gen_z, phase_gen_c):
+-                loss.accumulate_gradients(phase=phase.name, real_img=real_img, real_c=real_c, gen_z=gen_z, gen_c=gen_c, gain=phase.interval, cur_nimg=cur_nimg)
++                loss.accumulate_gradients(
++                    phase=phase.name, 
++                    real_img=real_img, 
++                    real_c=real_c, 
++                    gen_z=gen_z, 
++                    gen_c=gen_c, 
++                    gain=phase.interval, 
++                    cur_nimg=cur_nimg
++                )
++
++            # clip gradients if specified
++            phase.clip_fn(phase.module.parameters())
++
++            # accumulate flattened gradient histograms
++            if log_grad_hist and stats_tfevents is not None:
++                grads = get_batch_grad(phase.module)
++                if grads is None:
++                    pass
++                elif phase.name in ["Gmain", "Greg", "Gboth"]:
++                    generator_grads.append(grads)
++                elif phase.name in ["Dmain", "Dreg", "Dboth"]:
++                    discriminator_grads.append(grads)
++
+             phase.module.requires_grad_(False)
+ 
+             # Update weights.
+@@ -290,7 +379,24 @@ def training_loop(
+                     grads = flat.split([param.numel() for param in params])
+                     for param, grad in zip(params, grads):
+                         param.grad = grad.reshape(param.shape)
+-                phase.opt.step()
++
++                # optionally compute norm of optimizer updates
++                if log_update_norm and stats_tfevents is not None:
++                    if len(params) > 0:
++                        flat_params = torch.cat([param.flatten() for param in params])
++
++                    phase.opt.step()
++
++                    if len(params) > 0:
++                        updated_flat_params = torch.cat([param.view(-1) for param in params])
++                        norm = (updated_flat_params - flat_params).norm(2).cpu().item()
++                        if phase.name in ["Gmain", "Greg", "Gboth"]:
++                            generator_update_norms += norm
++                        elif phase.name in ["Dmain", "Dreg", "Dboth"]:
++                            discriminator_update_norms += norm
++                else: 
++                    # else, just normally update the parameters
++                    phase.opt.step()
+ 
+             # Phase done.
+             if phase.end_event is not None:
+@@ -400,14 +506,45 @@ def training_loop(
+             fields = dict(stats_dict, timestamp=timestamp)
+             stats_jsonl.write(json.dumps(fields) + '\n')
+             stats_jsonl.flush()
++
+         if stats_tfevents is not None:
+             global_step = int(cur_nimg / 1e3)
+             walltime = timestamp - start_time
++
+             for name, value in stats_dict.items():
+                 stats_tfevents.add_scalar(name, value.mean, global_step=global_step, walltime=walltime)
++
+             for name, value in stats_metrics.items():
+                 stats_tfevents.add_scalar(f'Metrics/{name}', value, global_step=global_step, walltime=walltime)
++            
++            if log_grad_hist:
++                _gen_grads = torch.cat(generator_grads)
++                _disc_grads = torch.cat(discriminator_grads)
++                print(f"Gen. grads:\t[{_gen_grads.min()}, {_gen_grads.max()}")
++                print(f"Disc. grads:\t[{_disc_grads.min()}, {_disc_grads.max()}")
++                stats_tfevents.add_histogram(
++                    f'Histogram/G_grads', 
++                    _gen_grads,
++                    bins=150,
++                    global_step=global_step, 
++                    walltime=walltime
++                )
++                stats_tfevents.add_histogram(
++                    f'Histogram/D_grads', 
++                    _disc_grads,
++                    bins=150,
++                    global_step=global_step, 
++                    walltime=walltime
++                )
++                del generator_grads
++                del discriminator_grads
++            
++            if log_update_norm:
++                stats_tfevents.add_scalar("Loss/G/norm_updates", generator_update_norms, global_step=global_step, walltime=walltime)
++                stats_tfevents.add_scalar("Loss/D/norm_updates", discriminator_update_norms, global_step=global_step, walltime=walltime)
++
+             stats_tfevents.flush()
++
+         if progress_fn is not None:
+             progress_fn(cur_nimg // 1000, total_kimg)
+ 
